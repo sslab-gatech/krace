@@ -1,0 +1,31 @@
+[submodule "tool/binutils"]
+	path = tool/binutils
+	url = git://sourceware.org/git/binutils-gdb.git
+[submodule "tool/llvm"]
+	path = tool/llvm
+	url = https://github.com/llvm/llvm-project.git
+[submodule "tool/gcc"]
+	path = tool/gcc
+	url = git://gcc.gnu.org/git/gcc.git
+[submodule "tool/qemu"]
+	path = tool/qemu
+	url = git://git.qemu.org/qemu.git
+[submodule "tool/musl"]
+	path = tool/musl
+	url = git://git.musl-libc.org/musl
+[submodule "kernel/linux"]
+	path = kernel/linux
+	url = git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+	ignore = all
+[submodule "fs/ext4/e2fsprogs"]
+	path = fs/ext4/e2fsprogs
+	url = git://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git
+[submodule "fs/btrfs/btrfs-progs"]
+	path = fs/btrfs/btrfs-progs
+	url = git://git.kernel.org/pub/scm/linux/kernel/git/kdave/btrfs-progs.git
+[submodule "fs/xfs/xfsprogs"]
+	path = fs/xfs/xfsprogs
+	url = git://git.kernel.org/pub/scm/fs/xfs/xfsprogs-dev.git
+[submodule "misc/json"]
+	path = misc/json
+	url = https://github.com/nlohmann/json.git

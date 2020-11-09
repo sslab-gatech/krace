@@ -1,0 +1,5653 @@
+diff --git a/Makefile b/Makefile
+index 79be70bf2899..3488104fa50f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -452,6 +452,7 @@ LINUXINCLUDE    := \
+ 		-I$(objtree)/arch/$(SRCARCH)/include/generated \
+ 		$(if $(building_out_of_srctree),-I$(srctree)/include) \
+ 		-I$(objtree)/include \
++		-I$(srctree)/lib/dart \
+ 		$(USERINCLUDE)
+ 
+ KBUILD_AFLAGS   := -D__ASSEMBLY__ -fno-PIE
+diff --git a/arch/x86/configs/racer_defconfig b/arch/x86/configs/racer_defconfig
+new file mode 100644
+index 000000000000..cb9e4d5df66a
+--- /dev/null
++++ b/arch/x86/configs/racer_defconfig
+@@ -0,0 +1,65 @@
++# support multi-processing
++CONFIG_SMP=y
++
++# enable preemption
++CONFIG_PREEMPT=y
++
++# module support
++CONFIG_MODULES=y
++CONFIG_MODULE_UNLOAD=y
++
++# use slab allocator
++CONFIG_SLAB=y
++
++# stack tweaks
++CONFIG_VMAP_STACK=n
++
++# kernel debugging
++CONFIG_DEBUG_INFO=y
++CONFIG_DEBUG_KERNEL=y
++CONFIG_GDB_SCRIPTS=y
++CONFIG_KALLSYMS_ALL=y
++CONFIG_UNUSED_SYMBOLS=n
++CONFIG_UNWINDER_ORC=y
++CONFIG_PRINTK_TIME=y
++
++# support initrd
++CONFIG_BLK_DEV_INITRD=y
++CONFIG_DEVTMPFS=y
++
++# default to no filesystems support
++CONFIG_EXT4_FS=n
++CONFIG_MISC_FILESYSTEMS=n
++CONFIG_NETWORK_FILESYSTEMS=n
++
++# use simple block layer
++CONFIG_BLK_DEV_BSG=n
++CONFIG_BLK_DEBUG_FS=n
++CONFIG_MQ_IOSCHED_DEADLINE=n
++CONFIG_MQ_IOSCHED_KYBER=n
++
++# enable loop device for fs image mounting
++CONFIG_BLK_DEV_LOOP=y
++CONFIG_BLK_DEV_LOOP_MIN_COUNT=1
++
++# disable unnecessary devices
++CONFIG_INPUT_KEYBOARD=n
++CONFIG_INPUT_MOUSE=n
++
++# disable unnecessary features
++CONFIG_LEGACY_PTYS=n
++
++# allow more panics
++CONFIG_PANIC_ON_OOPS=y
++CONFIG_PANIC_ON_OOPS_VALUE=1
++
++# randomization
++CONFIG_RANDOMIZE_BASE=y
++CONFIG_RANDOMIZE_MEMORY=y
++
++# misc configs
++CONFIG_LOG_BUF_SHIFT=18
++CONFIG_LOCALVERSION_AUTO=n
++
++# library configs
++CONFIG_LIBCRC32C=y
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c29976eca4a8..22e6a78c7e8b 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -358,6 +358,9 @@
+ 434	common	pidfd_open		__x64_sys_pidfd_open
+ 435	common	clone3			__x64_sys_clone3/ptregs
+ 
++# dart syscall
++500 common  dart		__x64_sys_dart
++
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+ # for native 64-bit operation. The __x32_compat_sys stubs are created
+diff --git a/block/bio.c b/block/bio.c
+index 8f0ed6228fc5..03c8dd5fa286 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -22,6 +22,10 @@
+ #include "blk.h"
+ #include "blk-rq-qos.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /*
+  * Test patch to inline a certain number of bi_io_vec's inside the bio
+  * itself, to shrink a bio data allocation from two mempool calls to one
+@@ -1705,7 +1709,20 @@ void update_io_ticks(struct hd_struct *part, unsigned long now)
+ 	stamp = READ_ONCE(part->stamp);
+ 	if (unlikely(stamp != now)) {
+ 		if (likely(cmpxchg(&part->stamp, stamp, now) == stamp)) {
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, pause,
++					DART_FLAG_NONE, 0
++			);
++			/* this percpu variable is allocated before DART runs */
++#endif
+ 			__part_stat_add(part, io_ticks, 1);
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, resume,
++					DART_FLAG_NONE, 0
++			);
++#endif
+ 		}
+ 	}
+ 	if (part->partno) {
+@@ -2169,6 +2186,11 @@ static int __init init_bio(void)
+ 	if (bioset_integrity_create(&fs_bio_set, BIO_POOL_SIZE))
+ 		panic("bio: can't create integrity pool\n");
+ 
++#ifdef CONFIG_DART
++	_dart_info_bio_slabs_addr = (data_64_t) (&bio_slabs);
++	_dart_info_bio_slabs_size = (data_64_t) (bio_slab_max * sizeof(struct bio_slab));
++#endif
++
+ 	return 0;
+ }
+ subsys_initcall(init_bio);
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index 1eec9cbe5a0a..b92baaaff6a8 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -75,6 +75,10 @@
+ #include "blk-mq-tag.h"
+ #include "blk-mq-sched.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /* PREFLUSH/FUA sequences */
+ enum {
+ 	REQ_FSEQ_PREFLUSH	= (1 << 0), /* pre-flushing in progress */
+@@ -273,8 +277,15 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	struct request *flush_rq = fq->flush_rq;
+ 
+ 	/* C1 described at the top of this file */
+-	if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending))
++	if (fq->flush_pending_idx != fq->flush_running_idx || list_empty(pending)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) fq
++		);
++#endif
+ 		return;
++	}
+ 
+ 	/* C2 and C3
+ 	 *
+@@ -284,8 +295,22 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	 */
+ 	if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
+ 	    time_before(jiffies,
+-			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT))
++			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) fq
++		);
++#endif
+ 		return;
++	}
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_arrive,
++			DART_FLAG_NONE, (hval_64_t) fq
++	);
++#endif
+ 
+ 	/*
+ 	 * Issue flush and toggle pending_idx.  This makes pending_idx
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index ec791156e9cc..9b3874bfa492 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -40,6 +40,10 @@
+ #include "blk-mq-sched.h"
+ #include "blk-rq-qos.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ static void blk_mq_poll_stats_start(struct request_queue *q);
+ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+ 
+@@ -629,6 +633,14 @@ static void __blk_mq_complete_request(struct request *rq)
+ static void hctx_unlock(struct blk_mq_hw_ctx *hctx, int srcu_idx)
+ 	__releases(hctx->srcu)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) (&hctx->srcu)
++	);
++#endif
++
+ 	if (!(hctx->flags & BLK_MQ_F_BLOCKING))
+ 		rcu_read_unlock();
+ 	else
+@@ -644,6 +656,14 @@ static void hctx_lock(struct blk_mq_hw_ctx *hctx, int *srcu_idx)
+ 		rcu_read_lock();
+ 	} else
+ 		*srcu_idx = srcu_read_lock(hctx->srcu);
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) (&hctx->srcu)
++	);
++#endif
+ }
+ 
+ /**
+@@ -1295,7 +1315,19 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+ 		queued++;
+ 	} while (!list_empty(list));
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
+ 	hctx->dispatched[queued_to_index(queued)]++;
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
+ 
+ 	/*
+ 	 * Any items that need requeuing? Stuff them into hctx->dispatch,
+@@ -1500,8 +1532,7 @@ bool blk_mq_run_hw_queue(struct blk_mq_hw_ctx *hctx, bool async)
+ 	 * quiesced.
+ 	 */
+ 	hctx_lock(hctx, &srcu_idx);
+-	need_run = !blk_queue_quiesced(hctx->queue) &&
+-		blk_mq_hctx_has_pending(hctx);
++	need_run = !blk_queue_quiesced(hctx->queue);
+ 	hctx_unlock(hctx, srcu_idx);
+ 
+ 	if (need_run) {
+diff --git a/block/blk-softirq.c b/block/blk-softirq.c
+index 457d9ba3eb20..7a840326cdce 100644
+--- a/block/blk-softirq.c
++++ b/block/blk-softirq.c
+@@ -12,6 +12,10 @@
+ #include <linux/sched.h>
+ #include <linux/sched/topology.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #include "blk.h"
+ 
+ static DEFINE_PER_CPU(struct list_head, blk_cpu_done);
+@@ -24,6 +28,11 @@ static __latent_entropy void blk_done_softirq(struct softirq_action *h)
+ {
+ 	struct list_head *cpu_list, local_list;
+ 
++#ifdef CONFIG_DART
++	bool __dart;
++	complete_fn *__func;
++#endif
++
+ 	local_irq_disable();
+ 	cpu_list = this_cpu_ptr(&blk_cpu_done);
+ 	list_replace_init(cpu_list, &local_list);
+@@ -33,8 +42,38 @@ static __latent_entropy void blk_done_softirq(struct softirq_action *h)
+ 		struct request *rq;
+ 
+ 		rq = list_entry(local_list.next, struct request, ipi_list);
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			__func = rq->q->mq_ops->complete;
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, block_enter,
++					DART_FLAG_NONE, (hval_64_t) rq,
++					(data_64_t) __func
++			);
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, background,
++					DART_FLAG_NONE, (hval_64_t) rq
++			);
++			list_del_init(&rq->ipi_list);
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, foreground,
++					DART_FLAG_NONE, (hval_64_t) rq
++			);
++			__func(rq);
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, block_exit,
++					DART_FLAG_NONE, (hval_64_t) rq,
++					(data_64_t) __func
++			);
++			dart_switch_rel_meta();
++		} else {
++#endif
+ 		list_del_init(&rq->ipi_list);
+ 		rq->q->mq_ops->complete(rq);
++#ifdef CONFIG_DART
++		}
++#endif
+ 	}
+ }
+ 
+@@ -46,9 +85,18 @@ static void trigger_softirq(void *data)
+ 	struct list_head *list;
+ 
+ 	local_irq_save(flags);
++
+ 	list = this_cpu_ptr(&blk_cpu_done);
+ 	list_add_tail(&rq->ipi_list, list);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, block_register,
++			DART_FLAG_NONE, (hval_64_t) rq,
++			(data_64_t) (rq->q->mq_ops->complete)
++	);
++#endif
++
+ 	if (list->next == &rq->ipi_list)
+ 		raise_softirq_irqoff(BLOCK_SOFTIRQ);
+ 
+@@ -127,6 +175,15 @@ void __blk_complete_request(struct request *req)
+ 	if (ccpu == cpu || shared) {
+ 		struct list_head *list;
+ do_local:
++
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				async, block_register,
++				DART_FLAG_NONE, (hval_64_t) req,
++				(data_64_t) (req->q->mq_ops->complete)
++		);
++#endif
++
+ 		list = this_cpu_ptr(&blk_cpu_done);
+ 		list_add_tail(&req->ipi_list, list);
+ 
+diff --git a/block/blk-timeout.c b/block/blk-timeout.c
+index 8aa68fae96ad..adbc2ea52042 100644
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@ -144,8 +144,25 @@ void blk_add_timer(struct request *req)
+ 		 * modifying the timer because expires for value X
+ 		 * will be X + something.
+ 		 */
+-		if (!timer_pending(&q->timeout) || (diff >= HZ / 2))
++		if (!timer_pending(&q->timeout) || (diff >= HZ / 2)) {
++#ifdef CONFIG_DART
++			if ((expiry / HZ) >= DART_TIMER_LIMIT_IN_SECONDS) {
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, pause,
++						DART_FLAG_NONE, 0
++				);
++			}
++#endif
+ 			mod_timer(&q->timeout, expiry);
++#ifdef CONFIG_DART
++			if ((expiry / HZ) >= DART_TIMER_LIMIT_IN_SECONDS) {
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, resume,
++						DART_FLAG_NONE, 0
++				);
++			}
++#endif
++		}
+ 	}
+ 
+ }
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index c55b63750757..53989ed73dc7 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -458,6 +458,13 @@ config MISC_RTSX
+ 	tristate
+ 	default MISC_RTSX_PCI || MISC_RTSX_USB
+ 
++config IVSHMEM
++	tristate "ivshmem device support"
++	depends on PCI && UIO
++	help
++	  This driver provides support for the ivshmem device.  ivshmem is
++	  a device provided by QEMU for Inter-VM shared memory.
++
+ config PVPANIC
+ 	tristate "pvpanic device support"
+ 	depends on HAS_IOMEM && (ACPI || OF)
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index c1860d35dc7e..685f6c9049fb 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -54,6 +54,7 @@ obj-$(CONFIG_CXL_BASE)		+= cxl/
+ obj-$(CONFIG_PCI_ENDPOINT_TEST)	+= pci_endpoint_test.o
+ obj-$(CONFIG_OCXL)		+= ocxl/
+ obj-y				+= cardreader/
++obj-$(CONFIG_IVSHMEM)		+= ivshmem.o
+ obj-$(CONFIG_PVPANIC)   	+= pvpanic.o
+ obj-$(CONFIG_HABANA_AI)		+= habanalabs/
+ obj-$(CONFIG_XILINX_SDFEC)	+= xilinx_sdfec.o
+diff --git a/drivers/misc/ivshmem.c b/drivers/misc/ivshmem.c
+new file mode 100644
+index 000000000000..3c0109ccfb3a
+--- /dev/null
++++ b/drivers/misc/ivshmem.c
+@@ -0,0 +1,136 @@
++/*
++ * Racer IVShmem Driver
++ *
++ * (C) 2009 Cam Macdonell
++ * (C) 2017 Henning Schild
++ * based on Hilscher CIF card driver (C) 2007 Hans J. Koch <hjk@linutronix.de>
++ *
++ * Licensed under GPL version 2 only.
++ *
++ */
++
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/uio_driver.h>
++
++#include <dart.h>
++
++static int ivshmem_pci_probe(struct pci_dev *dev,
++					const struct pci_device_id *id)
++{
++	resource_size_t addr, size;
++	struct uio_info *info;
++
++	info = kzalloc(sizeof(struct uio_info), GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++
++	/* get info from pci device */
++	if (pci_enable_device(dev))
++		goto out;
++
++	if (pci_request_regions(dev, "ivshmem"))
++		goto out_disable;
++
++	addr = pci_resource_start(dev, 2);
++	if (!addr)
++		goto out_release;
++
++	size = pci_resource_len(dev, 2);
++	if (size <= 0)
++		goto out_release;
++
++	pci_set_master(dev);
++
++	/* setup the uio device */
++	info->priv = dev;
++
++	info->mem[0].addr = addr + INSTMEM_OFFSET(dart_iseq) + INSTMEM_OFFSET_USER;
++	info->mem[0].size = INSTMEM_SIZE_USER;
++	info->mem[0].memtype = UIO_MEM_PHYS;
++	info->mem[0].name = "shm";
++
++	info->irq = UIO_IRQ_NONE;
++	info->irq_flags = 0;
++
++	info->name = "ivshmem";
++	info->version = "0.0.1";
++
++	if (uio_register_device(&dev->dev, info))
++		goto out_release;
++
++	pci_set_drvdata(dev, info);
++
++	/* pass the kernel memory to dart */
++	dart_shared = ioremap_wt(
++			addr + IVSHMEM_OFFSET_HEADER,
++			IVSHMEM_SHARED
++	);
++	if (!dart_shared)
++		goto out_release;
++
++	dart_private = ioremap_cache(
++			addr + INSTMEM_OFFSET(dart_iseq) + INSTMEM_OFFSET_KERN,
++			INSTMEM_SIZE_KERN
++	);
++	if (!dart_private)
++		goto out_release;
++
++	dart_reserved = ioremap_wt(
++			addr + IVSHMEM_OFFSET_RESERVED,
++			IVSHMEM_OFFSET_INSTANCES - IVSHMEM_OFFSET_RESERVED
++	);
++	if (!dart_reserved)
++		goto out_release;
++
++	return 0;
++
++out_release:
++	pci_release_regions(dev);
++out_disable:
++	pci_disable_device(dev);
++out:
++	kfree(info);
++	return -ENODEV;
++}
++
++static void ivshmem_pci_remove(struct pci_dev *dev)
++{
++	struct uio_info *info = pci_get_drvdata(dev);
++
++	iounmap(dart_reserved);
++	iounmap(dart_private);
++	iounmap(dart_shared);
++
++	pci_set_drvdata(dev, NULL);
++
++	uio_unregister_device(info);
++	pci_release_regions(dev);
++	pci_disable_device(dev);
++
++	kfree(info);
++}
++
++static struct pci_device_id ivshmem_pci_ids[] = {
++	{
++		.vendor =	0x1af4,
++		.device =	0x1110,
++		.subvendor =	PCI_ANY_ID,
++		.subdevice =	PCI_ANY_ID,
++	},
++	{ 0, }
++};
++MODULE_DEVICE_TABLE(pci, ivshmem_pci_ids);
++
++static struct pci_driver ivshmem_pci_driver = {
++	.name = "ivshmem",
++	.id_table = ivshmem_pci_ids,
++	.probe = ivshmem_pci_probe,
++	.remove = ivshmem_pci_remove,
++};
++
++module_pci_driver(ivshmem_pci_driver);
++
++MODULE_LICENSE("GPL v2");
++MODULE_AUTHOR("Cam Macdonell");
+diff --git a/fs/btrfs/async-thread.c b/fs/btrfs/async-thread.c
+index 2e9e13ffbd08..c02e3697a1a7 100644
+--- a/fs/btrfs/async-thread.c
++++ b/fs/btrfs/async-thread.c
+@@ -12,6 +12,10 @@
+ #include "async-thread.h"
+ #include "ctree.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ enum {
+ 	WORK_DONE_BIT,
+ 	WORK_ORDER_DONE_BIT,
+@@ -258,6 +262,11 @@ static void run_ordered_work(struct __btrfs_workqueue *wq)
+ 	struct btrfs_work *work;
+ 	spinlock_t *lock = &wq->list_lock;
+ 	unsigned long flags;
++	btrfs_func_t func;
++
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
+ 
+ 	while (1) {
+ 		void *wtag;
+@@ -278,9 +287,65 @@ static void run_ordered_work(struct __btrfs_workqueue *wq)
+ 		 */
+ 		if (test_and_set_bit(WORK_ORDER_DONE_BIT, &work->flags))
+ 			break;
++
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, pause,
++				DART_FLAG_NONE, 0
++		);
++#endif
++		func = work->ordered_func;
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, resume,
++				DART_FLAG_NONE, 0
++		);
++#endif
++
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, custom_enter,
++					DART_FLAG_NONE,
++					(hval_64_t) (&work->ordered_func),
++					(data_64_t) func
++			);
++			dart_switch_rel_meta();
++			/* woke up too early, delay tracing until actual function call */
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, background,
++					DART_FLAG_NONE,
++					(hval_64_t) (&work->ordered_func)
++			);
++		}
++#endif
++
+ 		trace_btrfs_ordered_sched(work);
+ 		spin_unlock_irqrestore(lock, flags);
+-		work->ordered_func(work);
++
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, foreground,
++				DART_FLAG_NONE,
++				(hval_64_t) (&work->ordered_func)
++		);
++#endif
++
++		func(work);
++
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, custom_exit,
++					DART_FLAG_NONE,
++					(hval_64_t) (&work->ordered_func),
++					(data_64_t) func
++			);
++			dart_switch_rel_meta();
++		}
++#endif
+ 
+ 		/* now take the lock again and drop our item from the list */
+ 		spin_lock_irqsave(lock, flags);
+@@ -302,6 +367,7 @@ static void run_ordered_work(struct __btrfs_workqueue *wq)
+ static void normal_work_helper(struct btrfs_work *work)
+ {
+ 	struct __btrfs_workqueue *wq;
++	btrfs_func_t od;
+ 	void *wtag;
+ 	int need_order = 0;
+ 
+@@ -316,6 +382,7 @@ static void normal_work_helper(struct btrfs_work *work)
+ 	if (work->ordered_func)
+ 		need_order = 1;
+ 	wq = work->wq;
++	od = work->ordered_func;
+ 	/* Safe for tracepoints in case work gets freed by the callback */
+ 	wtag = work;
+ 
+@@ -323,6 +390,14 @@ static void normal_work_helper(struct btrfs_work *work)
+ 	thresh_exec_hook(wq);
+ 	work->func(work);
+ 	if (need_order) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				async, custom_attach,
++				DART_FLAG_NONE,
++				(hval_64_t) (&work->ordered_func),
++				(data_64_t) od
++		);
++#endif
+ 		set_bit(WORK_DONE_BIT, &work->flags);
+ 		run_ordered_work(wq);
+ 	}
+@@ -352,6 +427,14 @@ static inline void __btrfs_queue_work(struct __btrfs_workqueue *wq,
+ 	thresh_queue_hook(wq);
+ 	if (work->ordered_func) {
+ 		spin_lock_irqsave(&wq->list_lock, flags);
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				async, custom_register,
++				DART_FLAG_NONE,
++				(hval_64_t) (&work->ordered_func),
++				(data_64_t) (work->ordered_func)
++		);
++#endif
+ 		list_add_tail(&work->ordered_list, &wq->ordered_list);
+ 		spin_unlock_irqrestore(&wq->list_lock, flags);
+ 	}
+diff --git a/fs/btrfs/block-group.c b/fs/btrfs/block-group.c
+index 670700cb1110..846a740f51ad 100644
+--- a/fs/btrfs/block-group.c
++++ b/fs/btrfs/block-group.c
+@@ -15,6 +15,10 @@
+ #include "tree-log.h"
+ #include "delalloc-space.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /*
+  * Return target flags in extended format or 0 if restripe for this chunk_type
+  * is not in progress
+@@ -648,6 +652,12 @@ static noinline void caching_thread(struct btrfs_work *work)
+ 	spin_lock(&block_group->lock);
+ 	block_group->caching_ctl = NULL;
+ 	block_group->cached = ret ? BTRFS_CACHE_ERROR : BTRFS_CACHE_FINISHED;
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE, (hval_64_t) (&block_group->cached)
++	);
++#endif
+ 	spin_unlock(&block_group->lock);
+ 
+ #ifdef CONFIG_BTRFS_DEBUG
+diff --git a/fs/btrfs/block-group.h b/fs/btrfs/block-group.h
+index c391800388dd..2bd23948fc50 100644
+--- a/fs/btrfs/block-group.h
++++ b/fs/btrfs/block-group.h
+@@ -242,9 +242,31 @@ static inline u64 btrfs_system_alloc_profile(struct btrfs_fs_info *fs_info)
+ static inline int btrfs_block_group_cache_done(
+ 		struct btrfs_block_group_cache *cache)
+ {
++	int retv;
+ 	smp_mb();
+-	return cache->cached == BTRFS_CACHE_FINISHED ||
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
++	retv = cache->cached == BTRFS_CACHE_FINISHED ||
+ 		cache->cached == BTRFS_CACHE_ERROR;
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
++#ifdef CONFIG_DART
++	if (retv) {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, (hval_64_t) (&cache->cached)
++		);
++	}
++#endif
++	return retv;
+ }
+ 
+ #endif /* BTRFS_BLOCK_GROUP_H */
+diff --git a/fs/btrfs/ctree.c b/fs/btrfs/ctree.c
+index e59cde204b2f..a56a41c77b33 100644
+--- a/fs/btrfs/ctree.c
++++ b/fs/btrfs/ctree.c
+@@ -227,7 +227,7 @@ int btrfs_copy_root(struct btrfs_trans_handle *trans,
+ 	struct btrfs_disk_key disk_key;
+ 
+ 	WARN_ON(test_bit(BTRFS_ROOT_REF_COWS, &root->state) &&
+-		trans->transid != fs_info->running_transaction->transid);
++		trans->transid != __btrfs_consume_running_transaction(fs_info)->transid);
+ 	WARN_ON(test_bit(BTRFS_ROOT_REF_COWS, &root->state) &&
+ 		trans->transid != root->last_trans);
+ 
+@@ -1071,7 +1071,7 @@ static noinline int __btrfs_cow_block(struct btrfs_trans_handle *trans,
+ 	btrfs_assert_tree_locked(buf);
+ 
+ 	WARN_ON(test_bit(BTRFS_ROOT_REF_COWS, &root->state) &&
+-		trans->transid != fs_info->running_transaction->transid);
++		trans->transid != __btrfs_consume_running_transaction(fs_info)->transid);
+ 	WARN_ON(test_bit(BTRFS_ROOT_REF_COWS, &root->state) &&
+ 		trans->transid != root->last_trans);
+ 
+@@ -1498,10 +1498,10 @@ noinline int btrfs_cow_block(struct btrfs_trans_handle *trans,
+ 		btrfs_err(fs_info,
+ 			"COW'ing blocks on a fs root that's being dropped");
+ 
+-	if (trans->transaction != fs_info->running_transaction)
++	if (trans->transaction != __btrfs_consume_running_transaction(fs_info))
+ 		WARN(1, KERN_CRIT "trans %llu running %llu\n",
+ 		       trans->transid,
+-		       fs_info->running_transaction->transid);
++		       __btrfs_consume_running_transaction(fs_info)->transid);
+ 
+ 	if (trans->transid != fs_info->generation)
+ 		WARN(1, KERN_CRIT "trans %llu running %llu\n",
+@@ -1609,7 +1609,7 @@ int btrfs_realloc_node(struct btrfs_trans_handle *trans,
+ 
+ 	parent_level = btrfs_header_level(parent);
+ 
+-	WARN_ON(trans->transaction != fs_info->running_transaction);
++	WARN_ON(trans->transaction != __btrfs_consume_running_transaction(fs_info));
+ 	WARN_ON(trans->transid != fs_info->generation);
+ 
+ 	parent_nritems = btrfs_header_nritems(parent);
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index fe2b8765d9e6..102ba38195b6 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -2643,7 +2643,21 @@ static inline int btrfs_fs_closing(struct btrfs_fs_info *fs_info)
+  */
+ static inline int btrfs_need_cleaner_sleep(struct btrfs_fs_info *fs_info)
+ {
+-	return fs_info->sb->s_flags & SB_RDONLY || btrfs_fs_closing(fs_info);
++	int r;
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
++	r = fs_info->sb->s_flags & SB_RDONLY;
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
++	return r || btrfs_fs_closing(fs_info);
+ }
+ 
+ static inline void free_fs_info(struct btrfs_fs_info *fs_info)
+diff --git a/fs/btrfs/dev-replace.c b/fs/btrfs/dev-replace.c
+index 48890826b5e6..210eb289155b 100644
+--- a/fs/btrfs/dev-replace.c
++++ b/fs/btrfs/dev-replace.c
+@@ -22,6 +22,10 @@
+ #include "dev-replace.h"
+ #include "sysfs.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ static int btrfs_dev_replace_finishing(struct btrfs_fs_info *fs_info,
+ 				       int scrub_ret);
+ static void btrfs_dev_replace_update_device_in_mapping_tree(
+@@ -1029,8 +1033,15 @@ void btrfs_bio_counter_inc_blocked(struct btrfs_fs_info *fs_info)
+ 	while (1) {
+ 		percpu_counter_inc(&fs_info->dev_replace.bio_counter);
+ 		if (likely(!test_bit(BTRFS_FS_STATE_DEV_REPLACING,
+-				     &fs_info->fs_state)))
++				     &fs_info->fs_state))) {
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_arrive, \
++					DART_FLAG_NONE, (hval_64_t) (&(fs_info->dev_replace.replace_wait))
++			);
++#endif
+ 			break;
++		}
+ 
+ 		btrfs_bio_counter_dec(fs_info);
+ 		wait_event(fs_info->dev_replace.replace_wait,
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 402b61bf345c..1b98f4f859ba 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -42,6 +42,10 @@
+ #include "ref-verify.h"
+ #include "block-group.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #define BTRFS_SUPER_FLAG_SUPP	(BTRFS_HEADER_FLAG_WRITTEN |\
+ 				 BTRFS_HEADER_FLAG_RELOC |\
+ 				 BTRFS_SUPER_FLAG_ERROR |\
+@@ -1090,7 +1094,7 @@ void btrfs_clean_tree_block(struct extent_buffer *buf)
+ {
+ 	struct btrfs_fs_info *fs_info = buf->fs_info;
+ 	if (btrfs_header_generation(buf) ==
+-	    fs_info->running_transaction->transid) {
++	    __btrfs_consume_running_transaction(fs_info)->transid) {
+ 		btrfs_assert_tree_locked(buf);
+ 
+ 		if (test_and_clear_bit(EXTENT_BUFFER_DIRTY, &buf->bflags)) {
+@@ -1724,6 +1728,13 @@ static int cleaner_kthread(void *arg)
+ 		if (!again) {
+ 			set_current_state(TASK_INTERRUPTIBLE);
+ 			schedule();
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_arrive,
++					DART_FLAG_NONE,
++					(hval_64_t) (&fs_info->cleaner_kthread)
++			);
++#endif
+ 			__set_current_state(TASK_RUNNING);
+ 		}
+ 	}
+@@ -1746,7 +1757,7 @@ static int transaction_kthread(void *arg)
+ 		mutex_lock(&fs_info->transaction_kthread_mutex);
+ 
+ 		spin_lock(&fs_info->trans_lock);
+-		cur = fs_info->running_transaction;
++		cur = __btrfs_consume_running_transaction(fs_info);
+ 		if (!cur) {
+ 			spin_unlock(&fs_info->trans_lock);
+ 			goto sleep;
+@@ -1777,6 +1788,13 @@ static int transaction_kthread(void *arg)
+ 			btrfs_end_transaction(trans);
+ 		}
+ sleep:
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE,
++				(hval_64_t) (&fs_info->cleaner_kthread)
++		);
++#endif
+ 		wake_up_process(fs_info->cleaner_kthread);
+ 		mutex_unlock(&fs_info->transaction_kthread_mutex);
+ 
+@@ -1785,8 +1803,16 @@ static int transaction_kthread(void *arg)
+ 			btrfs_cleanup_transaction(fs_info);
+ 		if (!kthread_should_stop() &&
+ 				(!btrfs_transaction_blocked(fs_info) ||
+-				 cannot_commit))
++				 cannot_commit)) {
+ 			schedule_timeout_interruptible(delay);
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_arrive,
++					DART_FLAG_NONE,
++					(hval_64_t) (&fs_info->transaction_kthread)
++			);
++#endif
++		}
+ 	} while (!kthread_should_stop());
+ 	return 0;
+ }
+@@ -3961,6 +3987,13 @@ int btrfs_commit_super(struct btrfs_fs_info *fs_info)
+ 
+ 	mutex_lock(&fs_info->cleaner_mutex);
+ 	btrfs_run_delayed_iputs(fs_info);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE,
++			(hval_64_t) (&fs_info->cleaner_kthread)
++	);
++#endif
+ 	mutex_unlock(&fs_info->cleaner_mutex);
+ 	wake_up_process(fs_info->cleaner_kthread);
+ 
+@@ -4552,7 +4585,7 @@ static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info)
+ 			spin_lock(&fs_info->trans_lock);
+ 			continue;
+ 		}
+-		if (t == fs_info->running_transaction) {
++		if (t == __btrfs_consume_running_transaction(fs_info)) {
+ 			t->state = TRANS_STATE_COMMIT_DOING;
+ 			spin_unlock(&fs_info->trans_lock);
+ 			/*
+@@ -4567,8 +4600,8 @@ static int btrfs_cleanup_transaction(struct btrfs_fs_info *fs_info)
+ 		btrfs_cleanup_one_transaction(t, fs_info);
+ 
+ 		spin_lock(&fs_info->trans_lock);
+-		if (t == fs_info->running_transaction)
+-			fs_info->running_transaction = NULL;
++		if (t == __btrfs_consume_running_transaction(fs_info))
++			__btrfs_deposit_running_transaction(fs_info, NULL);
+ 		list_del_init(&t->list);
+ 		spin_unlock(&fs_info->trans_lock);
+ 
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 49cb26fa7c63..6873cc6e4eb3 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -33,6 +33,10 @@
+ #include "delalloc-space.h"
+ #include "block-group.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #undef SCRAMBLE_DELAYED_REFS
+ 
+ 
+@@ -2251,7 +2255,7 @@ static noinline int check_delayed_ref(struct btrfs_root *root,
+ 	int ret = 0;
+ 
+ 	spin_lock(&root->fs_info->trans_lock);
+-	cur_trans = root->fs_info->running_transaction;
++	cur_trans = __btrfs_consume_running_transaction(root->fs_info);
+ 	if (cur_trans)
+ 		refcount_inc(&cur_trans->use_count);
+ 	spin_unlock(&root->fs_info->trans_lock);
+@@ -3941,6 +3945,10 @@ static noinline int find_free_extent(struct btrfs_fs_info *fs_info,
+ 			ret = btrfs_cache_block_group(block_group, 0);
+ 			BUG_ON(ret < 0);
+ 			ret = 0;
++#ifdef CONFIG_DART
++			/* the ad-hoc sync is crazy in this file, ignore them */
++			goto loop;
++#endif
+ 		}
+ 
+ 		if (unlikely(block_group->cached == BTRFS_CACHE_ERROR))
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index cceaf05aada2..c302ba9f36b2 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -235,13 +235,12 @@ int __init extent_io_init(void)
+ 
+ void __cold extent_io_exit(void)
+ {
+-	btrfs_leak_debug_check();
+-
+ 	/*
+ 	 * Make sure all delayed rcu free are flushed before we
+ 	 * destroy caches.
+ 	 */
+ 	rcu_barrier();
++	btrfs_leak_debug_check();
+ 	kmem_cache_destroy(extent_state_cache);
+ 	kmem_cache_destroy(extent_buffer_cache);
+ 	bioset_exit(&btrfs_bioset);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index c3f386b7cc0b..edfd82598eab 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -50,6 +50,10 @@
+ #include "delalloc-space.h"
+ #include "block-group.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ struct btrfs_iget_args {
+ 	struct btrfs_key *location;
+ 	struct btrfs_root *root;
+@@ -3354,8 +3358,16 @@ void btrfs_add_delayed_iput(struct inode *inode)
+ 	ASSERT(list_empty(&binode->delayed_iput));
+ 	list_add_tail(&binode->delayed_iput, &fs_info->delayed_iputs);
+ 	spin_unlock(&fs_info->delayed_iput_lock);
+-	if (!test_bit(BTRFS_FS_CLEANER_RUNNING, &fs_info->flags))
++	if (!test_bit(BTRFS_FS_CLEANER_RUNNING, &fs_info->flags)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE,
++				(hval_64_t) (&fs_info->cleaner_kthread)
++		);
++#endif
+ 		wake_up_process(fs_info->cleaner_kthread);
++	}
+ }
+ 
+ static void run_delayed_iput_locked(struct btrfs_fs_info *fs_info,
+diff --git a/fs/btrfs/relocation.c b/fs/btrfs/relocation.c
+index 5cd42b66818c..8575d7dedf6d 100644
+--- a/fs/btrfs/relocation.c
++++ b/fs/btrfs/relocation.c
+@@ -530,7 +530,7 @@ static int should_ignore_root(struct btrfs_root *root)
+ 		return 0;
+ 
+ 	if (btrfs_root_last_snapshot(&reloc_root->root_item) ==
+-	    root->fs_info->running_transaction->transid - 1)
++	    __btrfs_consume_running_transaction(root->fs_info)->transid - 1)
+ 		return 0;
+ 	/*
+ 	 * if there is reloc tree and it was created in previous
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index 1b151af25772..df051171e4e0 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -1506,6 +1506,10 @@ static struct dentry *btrfs_mount_root(struct file_system_type *fs_type,
+ 		goto error_sec_opts;
+ 	}
+ 
++#ifdef CONFIG_DART
++	__btrfs_deposit_running_transaction(fs_info, NULL);
++#endif
++
+ 	fs_info->super_copy = kzalloc(BTRFS_SUPER_INFO_SIZE, GFP_KERNEL);
+ 	fs_info->super_for_commit = kzalloc(BTRFS_SUPER_INFO_SIZE, GFP_KERNEL);
+ 	if (!fs_info->super_copy || !fs_info->super_for_commit) {
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 8624bdee8c5b..cc97ef050ebc 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -22,6 +22,10 @@
+ #include "qgroup.h"
+ #include "block-group.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #define BTRFS_ROOT_TRANS_TAG 0
+ 
+ static const unsigned int btrfs_blocked_trans_types[TRANS_STATE_MAX] = {
+@@ -167,7 +171,7 @@ static noinline int join_transaction(struct btrfs_fs_info *fs_info,
+ 		return -EROFS;
+ 	}
+ 
+-	cur_trans = fs_info->running_transaction;
++	cur_trans = __btrfs_consume_running_transaction(fs_info);
+ 	if (cur_trans) {
+ 		if (cur_trans->aborted) {
+ 			spin_unlock(&fs_info->trans_lock);
+@@ -203,7 +207,7 @@ static noinline int join_transaction(struct btrfs_fs_info *fs_info,
+ 		return -ENOMEM;
+ 
+ 	spin_lock(&fs_info->trans_lock);
+-	if (fs_info->running_transaction) {
++	if (__btrfs_consume_running_transaction(fs_info)) {
+ 		/*
+ 		 * someone started a transaction after we unlocked.  Make sure
+ 		 * to redo the checks above
+@@ -264,8 +268,8 @@ static noinline int join_transaction(struct btrfs_fs_info *fs_info,
+ 			IO_TREE_TRANS_DIRTY_PAGES, fs_info->btree_inode);
+ 	fs_info->generation++;
+ 	cur_trans->transid = fs_info->generation;
+-	fs_info->running_transaction = cur_trans;
+ 	cur_trans->aborted = 0;
++	__btrfs_deposit_running_transaction(fs_info, cur_trans);
+ 	spin_unlock(&fs_info->trans_lock);
+ 
+ 	return 0;
+@@ -397,7 +401,7 @@ static void wait_current_trans(struct btrfs_fs_info *fs_info)
+ 	struct btrfs_transaction *cur_trans;
+ 
+ 	spin_lock(&fs_info->trans_lock);
+-	cur_trans = fs_info->running_transaction;
++	cur_trans = __btrfs_consume_running_transaction(fs_info);
+ 	if (cur_trans && is_transaction_blocked(cur_trans)) {
+ 		refcount_inc(&cur_trans->use_count);
+ 		spin_unlock(&fs_info->trans_lock);
+@@ -407,6 +411,7 @@ static void wait_current_trans(struct btrfs_fs_info *fs_info)
+ 			   cur_trans->aborted);
+ 		btrfs_put_transaction(cur_trans);
+ 	} else {
++		DART_QUEUE_ARRIVE((fs_info->transaction_wait));
+ 		spin_unlock(&fs_info->trans_lock);
+ 	}
+ }
+@@ -557,7 +562,7 @@ start_transaction(struct btrfs_root *root, unsigned int num_items,
+ 	if (ret < 0)
+ 		goto join_fail;
+ 
+-	cur_trans = fs_info->running_transaction;
++	cur_trans = __btrfs_consume_running_transaction(fs_info);
+ 
+ 	h->transid = cur_trans->transid;
+ 	h->transaction = cur_trans;
+@@ -850,14 +855,22 @@ static int __btrfs_end_transaction(struct btrfs_trans_handle *trans,
+ 	if (lock && READ_ONCE(cur_trans->state) == TRANS_STATE_BLOCKED) {
+ 		if (throttle)
+ 			return btrfs_commit_transaction(trans);
+-		else
++		else {
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_notify,
++					DART_FLAG_NONE,
++					(hval_64_t) (&info->transaction_kthread)
++			);
++#endif
+ 			wake_up_process(info->transaction_kthread);
++		}
+ 	}
+ 
+ 	if (trans->type & __TRANS_FREEZABLE)
+ 		sb_end_intwrite(info->sb);
+ 
+-	WARN_ON(cur_trans != info->running_transaction);
++	WARN_ON(cur_trans != __btrfs_consume_running_transaction(info));
+ 	WARN_ON(atomic_read(&cur_trans->num_writers) < 1);
+ 	atomic_dec(&cur_trans->num_writers);
+ 	extwriter_counter_dec(cur_trans, trans->type);
+@@ -873,6 +886,13 @@ static int __btrfs_end_transaction(struct btrfs_trans_handle *trans,
+ 
+ 	if (trans->aborted ||
+ 	    test_bit(BTRFS_FS_STATE_ERROR, &info->fs_state)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE,
++				(hval_64_t) (&info->transaction_kthread)
++		);
++#endif
+ 		wake_up_process(info->transaction_kthread);
+ 		err = -EIO;
+ 	}
+@@ -1700,7 +1720,7 @@ int btrfs_transaction_in_commit(struct btrfs_fs_info *info)
+ 	int ret = 0;
+ 
+ 	spin_lock(&info->trans_lock);
+-	trans = info->running_transaction;
++	trans = __btrfs_consume_running_transaction(info);
+ 	if (trans)
+ 		ret = (trans->state >= TRANS_STATE_COMMIT_START);
+ 	spin_unlock(&info->trans_lock);
+@@ -1713,7 +1733,7 @@ int btrfs_transaction_blocked(struct btrfs_fs_info *info)
+ 	int ret = 0;
+ 
+ 	spin_lock(&info->trans_lock);
+-	trans = info->running_transaction;
++	trans = __btrfs_consume_running_transaction(info);
+ 	if (trans)
+ 		ret = is_transaction_blocked(trans);
+ 	spin_unlock(&info->trans_lock);
+@@ -1837,7 +1857,7 @@ static void cleanup_transaction(struct btrfs_trans_handle *trans, int err)
+ 	BUG_ON(list_empty(&cur_trans->list));
+ 
+ 	list_del_init(&cur_trans->list);
+-	if (cur_trans == fs_info->running_transaction) {
++	if (cur_trans == __btrfs_consume_running_transaction(fs_info)) {
+ 		cur_trans->state = TRANS_STATE_COMMIT_DOING;
+ 		spin_unlock(&fs_info->trans_lock);
+ 		wait_event(cur_trans->writer_wait,
+@@ -1850,8 +1870,8 @@ static void cleanup_transaction(struct btrfs_trans_handle *trans, int err)
+ 	btrfs_cleanup_one_transaction(trans->transaction, fs_info);
+ 
+ 	spin_lock(&fs_info->trans_lock);
+-	if (cur_trans == fs_info->running_transaction)
+-		fs_info->running_transaction = NULL;
++	if (cur_trans == __btrfs_consume_running_transaction(fs_info))
++		__btrfs_deposit_running_transaction(fs_info, NULL);
+ 	spin_unlock(&fs_info->trans_lock);
+ 
+ 	if (trans->type & __TRANS_FREEZABLE)
+@@ -2030,6 +2050,8 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 		btrfs_put_transaction(cur_trans);
+ 
+ 		return ret;
++	} else {
++		DART_QUEUE_ARRIVE((cur_trans->commit_wait));
+ 	}
+ 
+ 	cur_trans->state = TRANS_STATE_COMMIT_START;
+@@ -2049,6 +2071,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 			if (ret)
+ 				goto cleanup_transaction;
+ 		} else {
++			DART_QUEUE_ARRIVE((prev_trans->commit_wait));
+ 			spin_unlock(&fs_info->trans_lock);
+ 		}
+ 	} else {
+@@ -2225,7 +2248,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 
+ 	btrfs_prepare_extent_commit(fs_info);
+ 
+-	cur_trans = fs_info->running_transaction;
++	cur_trans = __btrfs_consume_running_transaction(fs_info);
+ 
+ 	btrfs_set_root_node(&fs_info->tree_root->root_item,
+ 			    fs_info->tree_root->node);
+@@ -2257,7 +2280,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+ 
+ 	spin_lock(&fs_info->trans_lock);
+ 	cur_trans->state = TRANS_STATE_UNBLOCKED;
+-	fs_info->running_transaction = NULL;
++	__btrfs_deposit_running_transaction(fs_info, NULL);
+ 	spin_unlock(&fs_info->trans_lock);
+ 	mutex_unlock(&fs_info->reloc_mutex);
+ 
+diff --git a/fs/btrfs/transaction.h b/fs/btrfs/transaction.h
+index 2c5a6f6e5bb0..ed09ec6703a4 100644
+--- a/fs/btrfs/transaction.h
++++ b/fs/btrfs/transaction.h
+@@ -11,6 +11,10 @@
+ #include "delayed-ref.h"
+ #include "ctree.h"
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ enum btrfs_trans_state {
+ 	TRANS_STATE_RUNNING,
+ 	TRANS_STATE_BLOCKED,
+@@ -209,6 +213,13 @@ static inline void btrfs_commit_transaction_locksafe(
+ 		struct btrfs_fs_info *fs_info)
+ {
+ 	set_bit(BTRFS_FS_NEED_ASYNC_COMMIT, &fs_info->flags);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE,
++			(hval_64_t) (&fs_info->transaction_kthread)
++	);
++#endif
+ 	wake_up_process(fs_info->transaction_kthread);
+ }
+ int btrfs_end_transaction_throttle(struct btrfs_trans_handle *trans);
+@@ -229,4 +240,30 @@ void btrfs_add_dropped_root(struct btrfs_trans_handle *trans,
+ 			    struct btrfs_root *root);
+ void btrfs_trans_release_chunk_metadata(struct btrfs_trans_handle *trans);
+ 
++static inline struct btrfs_transaction *__btrfs_consume_running_transaction(
++		struct btrfs_fs_info *info
++) {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			order, obj_consume,
++			DART_FLAG_NONE, 0,
++			(data_64_t) &info->running_transaction
++	);
++#endif
++	return info->running_transaction;
++}
++
++static inline void __btrfs_deposit_running_transaction(
++		struct btrfs_fs_info *info, struct btrfs_transaction *tran
++) {
++	info->running_transaction = tran;
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			order, obj_deposit,
++			DART_FLAG_NONE, 0,
++			(data_64_t) &info->running_transaction, (data_64_t) tran
++	);
++#endif
++}
++
+ #endif
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index bdfe4493e43a..7c8da62edf14 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -31,6 +31,10 @@
+ #include "space-info.h"
+ #include "block-group.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ const struct btrfs_raid_attr btrfs_raid_array[BTRFS_NR_RAID_TYPES] = {
+ 	[BTRFS_RAID_RAID10] = {
+ 		.sub_stripes	= 2,
+@@ -614,6 +618,12 @@ static noinline void run_scheduled_bios(struct btrfs_device *device)
+ 		}
+ 
+ 		cur = pending;
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, (hval_64_t) cur
++		);
++#endif
+ 		pending = pending->bi_next;
+ 		cur->bi_next = NULL;
+ 
+@@ -6446,13 +6456,19 @@ static noinline void btrfs_schedule_bio(struct btrfs_device *device,
+ 
+ 	if (pending_bios->tail)
+ 		pending_bios->tail->bi_next = bio;
+-
+ 	pending_bios->tail = bio;
+ 	if (!pending_bios->head)
+ 		pending_bios->head = bio;
+ 	if (device->running_pending)
+ 		should_queue = 0;
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE, (hval_64_t) bio
++	);
++#endif
++
+ 	spin_unlock(&device->io_lock);
+ 
+ 	if (should_queue)
+diff --git a/fs/dcache.c b/fs/dcache.c
+index e88cf0554e65..131ef557a333 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -35,6 +35,10 @@
+ #include "internal.h"
+ #include "mount.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /*
+  * Usage:
+  * dcache->d_inode->i_lock protects:
+@@ -2506,6 +2510,17 @@ static void d_wait_lookup(struct dentry *dentry)
+ 			schedule();
+ 			spin_lock(&dentry->d_lock);
+ 		} while (d_in_lookup(dentry));
++#ifdef CONFIG_DART
++		/*
++		 * there is no matching remove_wait_queue call for this,
++		 * as the queue head is set to NULL in __d_lookup_done directly...
++		 */
++		DART_FUNC_LIB_CALL_WRAP(
++				event, wait_pass,
++				DART_FLAG_NONE, (hval_64_t) (&wait),
++				(data_64_t) (wait.func)
++		);
++#endif
+ 	}
+ }
+ 
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 8461a6322039..fed6f06579f2 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -31,6 +31,10 @@
+ #include <linux/memcontrol.h>
+ #include "internal.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /*
+  * 4MB minimal write chunk size
+  */
+@@ -1325,11 +1329,25 @@ static void __inode_wait_for_writeback(struct inode *inode)
+ 	wait_queue_head_t *wqh;
+ 
+ 	wqh = bit_waitqueue(&inode->i_state, __I_SYNC);
+-	while (inode->i_state & I_SYNC) {
+-		spin_unlock(&inode->i_lock);
+-		__wait_on_bit(wqh, &wq, bit_wait,
+-			      TASK_UNINTERRUPTIBLE);
+-		spin_lock(&inode->i_lock);
++	while (1) {
++		if (inode->i_state & I_SYNC) {
++			spin_unlock(&inode->i_lock);
++			__wait_on_bit(wqh, &wq, bit_wait,
++					TASK_UNINTERRUPTIBLE);
++			spin_lock(&inode->i_lock);
++		} else {
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_arrive,
++					DART_FLAG_NONE,
++					_CANTOR_PAIR(
++						(hval_64_t) (&inode->i_state),
++						(hval_64_t) __I_SYNC
++					)
++			);
++#endif
++			break;
++		}
+ 	}
+ }
+ 
+@@ -2050,6 +2068,24 @@ static long wb_do_writeback(struct bdi_writeback *wb)
+ 	return wrote;
+ }
+ 
++static inline int __wb_work_list_empty(struct bdi_writeback *wb) {
++	int rv;
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
++	rv = list_empty(&wb->work_list);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
++	return rv;
++}
++
+ /*
+  * Handle writeback of dirty data for the device backed by this bdi. Also
+  * reschedules periodically and does kupdated style flushing.
+@@ -2074,7 +2110,7 @@ void wb_workfn(struct work_struct *work)
+ 		do {
+ 			pages_written = wb_do_writeback(wb);
+ 			trace_writeback_pages_written(pages_written);
+-		} while (!list_empty(&wb->work_list));
++		} while (!__wb_work_list_empty(wb));
+ 	} else {
+ 		/*
+ 		 * bdi_wq can't get enough workers and we're running off
+@@ -2086,7 +2122,7 @@ void wb_workfn(struct work_struct *work)
+ 		trace_writeback_pages_written(pages_written);
+ 	}
+ 
+-	if (!list_empty(&wb->work_list))
++	if (!__wb_work_list_empty(wb))
+ 		wb_wakeup(wb);
+ 	else if (wb_has_dirty_io(wb) && dirty_writeback_interval)
+ 		wb_wakeup_delayed(wb);
+diff --git a/fs/inode.c b/fs/inode.c
+index fef457a42882..275b22cbea68 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -464,11 +464,11 @@ EXPORT_SYMBOL_GPL(inode_sb_list_add);
+ 
+ static inline void inode_sb_list_del(struct inode *inode)
+ {
++	spin_lock(&inode->i_sb->s_inode_list_lock);  /* #ifdef CONFIG_DART */
+ 	if (!list_empty(&inode->i_sb_list)) {
+-		spin_lock(&inode->i_sb->s_inode_list_lock);
+ 		list_del_init(&inode->i_sb_list);
+-		spin_unlock(&inode->i_sb->s_inode_list_lock);
+ 	}
++	spin_unlock(&inode->i_sb->s_inode_list_lock);
+ }
+ 
+ static unsigned long hash(struct super_block *sb, unsigned long hashval)
+@@ -557,7 +557,7 @@ static void evict(struct inode *inode)
+ 	BUG_ON(!(inode->i_state & I_FREEING));
+ 	BUG_ON(!list_empty(&inode->i_lru));
+ 
+-	if (!list_empty(&inode->i_io_list))
++	/* if (!list_empty(&inode->i_io_list))   #ifdef CONFIG_DART */
+ 		inode_io_list_del(inode);
+ 
+ 	inode_sb_list_del(inode);
+diff --git a/include/asm-generic/bitops-instrumented.h b/include/asm-generic/bitops-instrumented.h
+index ddd1c6d9d8db..2634fc4ba7df 100644
+--- a/include/asm-generic/bitops-instrumented.h
++++ b/include/asm-generic/bitops-instrumented.h
+@@ -13,6 +13,10 @@
+ 
+ #include <linux/kasan-checks.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ /**
+  * set_bit - Atomically set a bit in memory
+  * @nr: the bit to set
+@@ -81,6 +85,13 @@ static inline void __clear_bit(long nr, volatile unsigned long *addr)
+  */
+ static inline void clear_bit_unlock(long nr, volatile unsigned long *addr)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE,
++			_CANTOR_PAIR((data_64_t) nr, (data_64_t) addr)
++	);
++#endif
+ 	kasan_check_write(addr + BIT_WORD(nr), sizeof(long));
+ 	arch_clear_bit_unlock(nr, addr);
+ }
+@@ -96,6 +107,13 @@ static inline void clear_bit_unlock(long nr, volatile unsigned long *addr)
+  */
+ static inline void __clear_bit_unlock(long nr, volatile unsigned long *addr)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE,
++			_CANTOR_PAIR((data_64_t) nr, (data_64_t) addr)
++	);
++#endif
+ 	kasan_check_write(addr + BIT_WORD(nr), sizeof(long));
+ 	arch___clear_bit_unlock(nr, addr);
+ }
+@@ -169,8 +187,21 @@ static inline bool __test_and_set_bit(long nr, volatile unsigned long *addr)
+  */
+ static inline bool test_and_set_bit_lock(long nr, volatile unsigned long *addr)
+ {
++	bool retv;
+ 	kasan_check_write(addr + BIT_WORD(nr), sizeof(long));
+-	return arch_test_and_set_bit_lock(nr, addr);
++	retv = arch_test_and_set_bit_lock(nr, addr);
++
++#ifdef CONFIG_DART
++	if (!retv) {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE,
++				_CANTOR_PAIR((data_64_t) nr, (data_64_t) addr)
++		);
++	}
++#endif
++
++	return retv;
+ }
+ 
+ /**
+@@ -253,6 +284,13 @@ static inline bool test_bit(long nr, const volatile unsigned long *addr)
+ static inline bool
+ clear_bit_unlock_is_negative_byte(long nr, volatile unsigned long *addr)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE,
++			_CANTOR_PAIR((data_64_t) nr, (data_64_t) addr)
++	);
++#endif
+ 	kasan_check_write(addr + BIT_WORD(nr), sizeof(long));
+ 	return arch_clear_bit_unlock_is_negative_byte(nr, addr);
+ }
+diff --git a/include/linux/bit_spinlock.h b/include/linux/bit_spinlock.h
+index bbc4730a6505..776d4238b3f5 100644
+--- a/include/linux/bit_spinlock.h
++++ b/include/linux/bit_spinlock.h
+@@ -22,6 +22,12 @@ static inline void bit_spin_lock(int bitnum, unsigned long *addr)
+ 	 * busywait with less bus contention for a good time to
+ 	 * attempt to acquire the lock bit.
+ 	 */
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
+ 	preempt_disable();
+ #if defined(CONFIG_SMP) || defined(CONFIG_DEBUG_SPINLOCK)
+ 	while (unlikely(test_and_set_bit_lock(bitnum, addr))) {
+@@ -33,6 +39,19 @@ static inline void bit_spin_lock(int bitnum, unsigned long *addr)
+ 	}
+ #endif
+ 	__acquire(bitlock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			_CANTOR_PAIR((data_64_t) bitnum, (data_64_t) addr)
++	);
++#endif
+ }
+ 
+ /*
+@@ -40,14 +59,39 @@ static inline void bit_spin_lock(int bitnum, unsigned long *addr)
+  */
+ static inline int bit_spin_trylock(int bitnum, unsigned long *addr)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
+ 	preempt_disable();
+ #if defined(CONFIG_SMP) || defined(CONFIG_DEBUG_SPINLOCK)
+ 	if (unlikely(test_and_set_bit_lock(bitnum, addr))) {
+ 		preempt_enable();
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, resume,
++				DART_FLAG_NONE, 0
++		);
++#endif
+ 		return 0;
+ 	}
+ #endif
+ 	__acquire(bitlock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 1, 1), 0,
++			_CANTOR_PAIR((data_64_t) bitnum, (data_64_t) addr)
++	);
++#endif
+ 	return 1;
+ }
+ 
+@@ -56,6 +100,20 @@ static inline int bit_spin_trylock(int bitnum, unsigned long *addr)
+  */
+ static inline void bit_spin_unlock(int bitnum, unsigned long *addr)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			_CANTOR_PAIR((data_64_t) bitnum, (data_64_t) addr)
++	);
++#endif
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
++
+ #ifdef CONFIG_DEBUG_SPINLOCK
+ 	BUG_ON(!test_bit(bitnum, addr));
+ #endif
+@@ -64,6 +122,12 @@ static inline void bit_spin_unlock(int bitnum, unsigned long *addr)
+ #endif
+ 	preempt_enable();
+ 	__release(bitlock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
+ }
+ 
+ /*
+@@ -73,6 +137,13 @@ static inline void bit_spin_unlock(int bitnum, unsigned long *addr)
+  */
+ static inline void __bit_spin_unlock(int bitnum, unsigned long *addr)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			_CANTOR_PAIR((data_64_t) bitnum, (data_64_t) addr)
++	);
++#endif
+ #ifdef CONFIG_DEBUG_SPINLOCK
+ 	BUG_ON(!test_bit(bitnum, addr));
+ #endif
+diff --git a/include/linux/kmemleak.h b/include/linux/kmemleak.h
+index 34684b2026ab..01bbaf75cb6a 100644
+--- a/include/linux/kmemleak.h
++++ b/include/linux/kmemleak.h
+@@ -56,37 +56,98 @@ static inline void kmemleak_erase(void **ptr)
+ 
+ #else
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ static inline void kmemleak_init(void)
+ {
+ }
+ static inline void kmemleak_alloc(const void *ptr, size_t size, int min_count,
+ 				  gfp_t gfp)
+ {
++#ifdef CONFIG_DART
++	if (ptr && !IS_ERR(ptr)) {
++		DART_FUNC_LIB_CALL_WRAP(
++				mem, heap_alloc,
++				DART_FLAG_NONE, 0,
++				(data_64_t) ptr, (data_64_t) size
++		);
++	}
++#endif
+ }
+ static inline void kmemleak_alloc_recursive(const void *ptr, size_t size,
+ 					    int min_count, slab_flags_t flags,
+ 					    gfp_t gfp)
+ {
++#ifdef CONFIG_DART
++	kmemleak_alloc(ptr, size, min_count, gfp);
++#endif
+ }
+ static inline void kmemleak_alloc_percpu(const void __percpu *ptr, size_t size,
+ 					 gfp_t gfp)
+ {
++#ifdef CONFIG_DART
++	unsigned int cpu;
++
++	if (ptr && !IS_ERR(ptr)) {
++		for_each_possible_cpu(cpu) {
++			DART_FUNC_LIB_CALL_WRAP(
++					mem, percpu_alloc,
++					DART_FLAG_NONE, 0,
++					(data_64_t) (per_cpu_ptr(ptr, cpu)), (data_64_t) size
++			);
++		}
++	}
++#endif
+ }
+ static inline void kmemleak_vmalloc(const struct vm_struct *area, size_t size,
+ 				    gfp_t gfp)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			mem, heap_alloc,
++			DART_FLAG_NONE, 0,
++			(data_64_t) (area->addr), (data_64_t) size
++	);
++#endif
+ }
+ static inline void kmemleak_free(const void *ptr)
+ {
++#ifdef CONFIG_DART
++	if (ptr && !IS_ERR(ptr)) {
++		DART_FUNC_LIB_CALL_WRAP(
++				mem, heap_free,
++				DART_FLAG_NONE, 0,
++				(data_64_t) ptr
++		);
++	}
++#endif
+ }
+ static inline void kmemleak_free_part(const void *ptr, size_t size)
+ {
+ }
+ static inline void kmemleak_free_recursive(const void *ptr, slab_flags_t flags)
+ {
++#ifdef CONFIG_DART
++	kmemleak_free(ptr);
++#endif
+ }
+ static inline void kmemleak_free_percpu(const void __percpu *ptr)
+ {
++#ifdef CONFIG_DART
++	unsigned int cpu;
++
++	if (ptr && !IS_ERR(ptr)) {
++		for_each_possible_cpu(cpu) {
++			DART_FUNC_LIB_CALL_WRAP(
++					mem, percpu_free,
++					DART_FLAG_NONE, 0,
++					(data_64_t) (per_cpu_ptr(ptr, cpu))
++			);
++		}
++	}
++#endif
+ }
+ static inline void kmemleak_update_trace(const void *ptr)
+ {
+diff --git a/include/linux/list.h b/include/linux/list.h
+index 85c92555e31f..a317d470b93c 100644
+--- a/include/linux/list.h
++++ b/include/linux/list.h
+@@ -8,6 +8,10 @@
+ #include <linux/const.h>
+ #include <linux/kernel.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ /*
+  * Simple doubly linked list implementation.
+  *
+@@ -283,8 +287,31 @@ static inline int list_empty(const struct list_head *head)
+  */
+ static inline int list_empty_careful(const struct list_head *head)
+ {
+-	struct list_head *next = head->next;
+-	return (next == head) && (next == head->prev);
++	struct list_head *next;
++	int retv;
++
++#ifdef CONFIG_DART
++	/*
++	 * Operations in this function can race (see the comments above)
++	 * Therefore, we trust the developers to put it into proper use
++	 */
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
++
++	next = head->next;
++	retv = (next == head) && (next == head->prev);
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
++
++	return retv;
+ }
+ 
+ /**
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index 37a4d9e32cd3..02ad322c9502 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -16,6 +16,10 @@
+ #include <linux/hardirq.h> /* for in_interrupt() */
+ #include <linux/hugetlb_inline.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ struct pagevec;
+ 
+ /*
+@@ -525,12 +529,33 @@ static inline void wait_on_page_locked(struct page *page)
+ {
+ 	if (PageLocked(page))
+ 		wait_on_page_bit(compound_head(page), PG_locked);
++#ifdef CONFIG_DART
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, _CANTOR_PAIR(
++					(hval_64_t) page,
++					(hval_64_t) PG_locked
++				)
++		);
++	}
++#endif
+ }
+ 
+ static inline int wait_on_page_locked_killable(struct page *page)
+ {
+-	if (!PageLocked(page))
++	if (!PageLocked(page)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, _CANTOR_PAIR(
++					(hval_64_t) page,
++					(hval_64_t) PG_locked
++				)
++		);
++#endif
+ 		return 0;
++	}
+ 	return wait_on_page_bit_killable(compound_head(page), PG_locked);
+ }
+ 
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 3998cdf9cd14..c32569eb203c 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -9,6 +9,10 @@
+ #include <linux/rcu_sync.h>
+ #include <linux/lockdep.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ struct percpu_rw_semaphore {
+ 	struct rcu_sync		rss;
+ 	unsigned int __percpu	*read_count;
+@@ -56,6 +60,14 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+ 	 * bleeding the critical section out.
+ 	 */
+ 	preempt_enable();
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
+ }
+ 
+ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+@@ -75,14 +87,31 @@ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+ 	 * bleeding the critical section out.
+ 	 */
+ 
+-	if (ret)
++	if (ret) {
+ 		rwsem_acquire_read(&sem->rw_sem.dep_map, 0, 1, _RET_IP_);
+ 
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(0, 1, 1), 0,
++				(data_64_t) sem
++		);
++#endif
++	}
++
+ 	return ret;
+ }
+ 
+ static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
++
+ 	preempt_disable();
+ 	/*
+ 	 * Same as in percpu_down_read().
+diff --git a/include/linux/rcupdate.h b/include/linux/rcupdate.h
+index 75a2eded7aa2..a7a02089321c 100644
+--- a/include/linux/rcupdate.h
++++ b/include/linux/rcupdate.h
+@@ -30,6 +30,10 @@
+ #include <asm/processor.h>
+ #include <linux/cpumask.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ #define ULONG_CMP_GE(a, b)	(ULONG_MAX / 2 >= (a) - (b))
+ #define ULONG_CMP_LT(a, b)	(ULONG_MAX / 2 < (a) - (b))
+ #define ulong2long(a)		(*(long *)(&(a)))
+@@ -292,6 +296,17 @@ static inline void rcu_preempt_sleep_check(void) { }
+ 
+ #endif /* #else #ifdef CONFIG_PROVE_RCU */
+ 
++#ifdef CONFIG_DART
++#define DART_PS_ANNOTATION(mode, addr) \
++		DART_FUNC_LIB_CALL_WRAP( \
++				order, ps_##mode, \
++				DART_FLAG_NONE, 0, \
++				(hval_64_t) (addr) \
++		);
++#else
++#define DART_PS_ANNOTATION(mode, p)
++#endif
++
+ /*
+  * Helper functions for rcu_dereference_check(), rcu_dereference_protected()
+  * and rcu_assign_pointer().  Some of these could be folded into their
+@@ -309,28 +324,49 @@ static inline void rcu_preempt_sleep_check(void) { }
+ 
+ #define __rcu_access_pointer(p, space) \
+ ({ \
+-	typeof(*p) *_________p1 = (typeof(*p) *__force)READ_ONCE(p); \
++	typeof(p) *________pp = &(p); \
++	typeof(*p) *________p1; \
++	DART_PS_ANNOTATION(subscribe, ________pp); \
++	________p1 = (typeof(*p) *__force)READ_ONCE(*________pp); \
+ 	rcu_check_sparse(p, space); \
+-	((typeof(*p) __force __kernel *)(_________p1)); \
++	((typeof(*p) __force __kernel *)(________p1)); \
+ })
+ #define __rcu_dereference_check(p, c, space) \
+ ({ \
+ 	/* Dependency order vs. p above. */ \
+-	typeof(*p) *________p1 = (typeof(*p) *__force)READ_ONCE(p); \
++	typeof(p) *________pp = &(p); \
++	typeof(*p) *________p1; \
++	DART_PS_ANNOTATION(subscribe, ________pp); \
++	________p1 = (typeof(*p) *__force)READ_ONCE(*________pp); \
+ 	RCU_LOCKDEP_WARN(!(c), "suspicious rcu_dereference_check() usage"); \
+ 	rcu_check_sparse(p, space); \
+ 	((typeof(*p) __force __kernel *)(________p1)); \
+ })
+ #define __rcu_dereference_protected(p, c, space) \
++({ \
++	typeof(p) *________pp = &(p); \
++	typeof(*p) *________p1; \
++	DART_PS_ANNOTATION(subscribe, ________pp); \
++	________p1 = (typeof(*p) *__force)(*________pp); \
++	RCU_LOCKDEP_WARN(!(c), "suspicious rcu_dereference_protected() usage"); \
++	rcu_check_sparse(p, space); \
++	((typeof(*p) __force __kernel *)(________p1)); \
++})
++#ifdef CONFIG_DART
++#define __rcu_dereference_protected_no_dart(p, c, space) \
+ ({ \
+ 	RCU_LOCKDEP_WARN(!(c), "suspicious rcu_dereference_protected() usage"); \
+ 	rcu_check_sparse(p, space); \
+ 	((typeof(*p) __force __kernel *)(p)); \
+ })
++#endif
+ #define rcu_dereference_raw(p) \
+ ({ \
+ 	/* Dependency order vs. p above. */ \
+-	typeof(p) ________p1 = READ_ONCE(p); \
++	typeof(p) *________pp = &(p); \
++	typeof(*p) *________p1; \
++	DART_PS_ANNOTATION(subscribe, ________pp); \
++	________p1 = READ_ONCE(*________pp); \
+ 	((typeof(*p) __force __kernel *)(________p1)); \
+ })
+ 
+@@ -371,15 +407,18 @@ static inline void rcu_preempt_sleep_check(void) { }
+  * please be careful when making changes to rcu_assign_pointer() and the
+  * other macros that it invokes.
+  */
+-#define rcu_assign_pointer(p, v)					      \
+-do {									      \
+-	uintptr_t _r_a_p__v = (uintptr_t)(v);				      \
+-	rcu_check_sparse(p, __rcu);					      \
+-									      \
+-	if (__builtin_constant_p(v) && (_r_a_p__v) == (uintptr_t)NULL)	      \
+-		WRITE_ONCE((p), (typeof(p))(_r_a_p__v));		      \
+-	else								      \
+-		smp_store_release(&p, RCU_INITIALIZER((typeof(p))_r_a_p__v)); \
++#define rcu_assign_pointer(p, v) \
++do { \
++	typeof(p) *________pp = ({ &(p); }); \
++	uintptr_t _r_a_p__v = (uintptr_t)(v); \
++	rcu_check_sparse(p, __rcu); \
++	\
++	if (__builtin_constant_p(v) && (_r_a_p__v) == (uintptr_t)NULL) \
++		WRITE_ONCE(*________pp, (typeof(p))(_r_a_p__v)); \
++	else \
++		smp_store_release(________pp, RCU_INITIALIZER((typeof(p))_r_a_p__v)); \
++	\
++	DART_PS_ANNOTATION(publish, ________pp); \
+ } while (0)
+ 
+ /**
+@@ -504,6 +543,10 @@ do {									      \
+ #define rcu_dereference_protected(p, c) \
+ 	__rcu_dereference_protected((p), (c), __rcu)
+ 
++#ifdef CONFIG_DART
++#define rcu_dereference_protected_no_dart(p, c) \
++	__rcu_dereference_protected_no_dart((p), (c), __rcu)
++#endif
+ 
+ /**
+  * rcu_dereference() - fetch RCU-protected pointer for dereferencing
+@@ -599,6 +642,14 @@ static __always_inline void rcu_read_lock(void)
+ 	rcu_lock_acquire(&rcu_lock_map);
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+ 			 "rcu_read_lock() used illegally while idle");
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, rcu_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			DART_LOCK_ID_RCU
++	);
++#endif
+ }
+ 
+ /*
+@@ -646,6 +697,14 @@ static __always_inline void rcu_read_lock(void)
+  */
+ static inline void rcu_read_unlock(void)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, rcu_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			DART_LOCK_ID_RCU
++	);
++#endif
++
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+ 			 "rcu_read_unlock() used illegally while idle");
+ 	__release(RCU);
+@@ -672,6 +731,14 @@ static inline void rcu_read_lock_bh(void)
+ 	rcu_lock_acquire(&rcu_bh_lock_map);
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+ 			 "rcu_read_lock_bh() used illegally while idle");
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, rcu_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			DART_LOCK_ID_RCU
++	);
++#endif
+ }
+ 
+ /*
+@@ -681,6 +748,14 @@ static inline void rcu_read_lock_bh(void)
+  */
+ static inline void rcu_read_unlock_bh(void)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, rcu_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			DART_LOCK_ID_RCU
++	);
++#endif
++
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+ 			 "rcu_read_unlock_bh() used illegally while idle");
+ 	rcu_lock_release(&rcu_bh_lock_map);
+@@ -707,6 +782,14 @@ static inline void rcu_read_lock_sched(void)
+ 	rcu_lock_acquire(&rcu_sched_lock_map);
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+ 			 "rcu_read_lock_sched() used illegally while idle");
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, rcu_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			DART_LOCK_ID_RCU
++	);
++#endif
+ }
+ 
+ /* Used by lockdep and tracing: cannot be traced, cannot call lockdep. */
+@@ -723,6 +806,14 @@ static inline notrace void rcu_read_lock_sched_notrace(void)
+  */
+ static inline void rcu_read_unlock_sched(void)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, rcu_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			DART_LOCK_ID_RCU
++	);
++#endif
++
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(),
+ 			 "rcu_read_unlock_sched() used illegally while idle");
+ 	rcu_lock_release(&rcu_sched_lock_map);
+@@ -777,8 +868,10 @@ static inline notrace void rcu_read_unlock_sched_notrace(void)
+  */
+ #define RCU_INIT_POINTER(p, v) \
+ 	do { \
++		typeof(p) *________pp = ({ &(p); }); \
+ 		rcu_check_sparse(p, __rcu); \
+-		WRITE_ONCE(p, RCU_INITIALIZER(v)); \
++		WRITE_ONCE(*________pp, RCU_INITIALIZER(v)); \
++		DART_PS_ANNOTATION(publish, ________pp); \
+ 	} while (0)
+ 
+ /**
+diff --git a/include/linux/rhashtable.h b/include/linux/rhashtable.h
+index beb9a9da1699..fc06341e88e2 100644
+--- a/include/linux/rhashtable.h
++++ b/include/linux/rhashtable.h
+@@ -269,14 +269,24 @@ struct rhash_lock_head **rht_bucket_nested_insert(struct rhashtable *ht,
+ 						  struct bucket_table *tbl,
+ 						  unsigned int hash);
+ 
++#ifdef CONFIG_DART
++#define rht_dereference(p, ht) \
++	rcu_dereference_protected_no_dart(p, lockdep_rht_mutex_is_held(ht))
++#else
+ #define rht_dereference(p, ht) \
+ 	rcu_dereference_protected(p, lockdep_rht_mutex_is_held(ht))
++#endif
+ 
+ #define rht_dereference_rcu(p, ht) \
+ 	rcu_dereference_check(p, lockdep_rht_mutex_is_held(ht))
+ 
++#ifdef CONFIG_DART
++#define rht_dereference_bucket(p, tbl, hash) \
++	rcu_dereference_protected_no_dart(p, lockdep_rht_bucket_is_held(tbl, hash))
++#else
+ #define rht_dereference_bucket(p, tbl, hash) \
+ 	rcu_dereference_protected(p, lockdep_rht_bucket_is_held(tbl, hash))
++#endif
+ 
+ #define rht_dereference_bucket_rcu(p, tbl, hash) \
+ 	rcu_dereference_check(p, lockdep_rht_bucket_is_held(tbl, hash))
+@@ -383,7 +393,11 @@ static inline struct rhash_head *rht_ptr(
+ static inline struct rhash_head *rht_ptr_exclusive(
+ 	struct rhash_lock_head *const *bkt)
+ {
++#ifdef CONFIG_DART
++	return rcu_dereference_protected_no_dart(__rht_ptr(bkt), 1);
++#else
+ 	return rcu_dereference_protected(__rht_ptr(bkt), 1);
++#endif
+ }
+ 
+ static inline void rht_assign_locked(struct rhash_lock_head **bkt,
+@@ -406,6 +420,13 @@ static inline void rht_assign_unlock(struct bucket_table *tbl,
+ 		obj = NULL;
+ 	lock_map_release(&tbl->dep_map);
+ 	rcu_assign_pointer(*p, obj);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			_CANTOR_PAIR((data_64_t) 0, (data_64_t) bkt)
++	);
++#endif
+ 	preempt_enable();
+ 	__release(bitlock);
+ 	local_bh_enable();
+diff --git a/include/linux/seqlock.h b/include/linux/seqlock.h
+index bcf4cf26b8c8..43bcd09f9429 100644
+--- a/include/linux/seqlock.h
++++ b/include/linux/seqlock.h
+@@ -39,6 +39,10 @@
+ #include <linux/compiler.h>
+ #include <asm/processor.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ /*
+  * Version using sequence counter only.
+  * This can be used when code has its own mutex protecting the
+@@ -109,12 +113,21 @@ static inline unsigned __read_seqcount_begin(const seqcount_t *s)
+ {
+ 	unsigned ret;
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, seq_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) s
++	);
++#endif
++
+ repeat:
+ 	ret = READ_ONCE(s->sequence);
+ 	if (unlikely(ret & 1)) {
+ 		cpu_relax();
+ 		goto repeat;
+ 	}
++
+ 	return ret;
+ }
+ 
+@@ -129,7 +142,17 @@ static inline unsigned __read_seqcount_begin(const seqcount_t *s)
+  */
+ static inline unsigned raw_read_seqcount(const seqcount_t *s)
+ {
+-	unsigned ret = READ_ONCE(s->sequence);
++	unsigned ret;
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, seq_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) s
++	);
++#endif
++
++	ret = READ_ONCE(s->sequence);
+ 	smp_rmb();
+ 	return ret;
+ }
+@@ -181,8 +204,19 @@ static inline unsigned read_seqcount_begin(const seqcount_t *s)
+  */
+ static inline unsigned raw_seqcount_begin(const seqcount_t *s)
+ {
+-	unsigned ret = READ_ONCE(s->sequence);
++	unsigned ret;
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, seq_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) s
++	);
++#endif
++
++	ret = READ_ONCE(s->sequence);
+ 	smp_rmb();
++
+ 	return ret & ~1;
+ }
+ 
+@@ -202,7 +236,15 @@ static inline unsigned raw_seqcount_begin(const seqcount_t *s)
+  */
+ static inline int __read_seqcount_retry(const seqcount_t *s, unsigned start)
+ {
+-	return unlikely(s->sequence != start);
++	int r = unlikely(s->sequence != start);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, seq_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) s
++	);
++#endif
++	return r;
+ }
+ 
+ /**
+@@ -225,6 +267,14 @@ static inline int read_seqcount_retry(const seqcount_t *s, unsigned start)
+ 
+ static inline void raw_write_seqcount_begin(seqcount_t *s)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, seq_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) s
++	);
++#endif
++
+ 	s->sequence++;
+ 	smp_wmb();
+ }
+@@ -233,6 +283,14 @@ static inline void raw_write_seqcount_end(seqcount_t *s)
+ {
+ 	smp_wmb();
+ 	s->sequence++;
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, seq_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) s
++	);
++#endif
+ }
+ 
+ /**
+@@ -279,7 +337,17 @@ static inline void raw_write_seqcount_barrier(seqcount_t *s)
+ static inline int raw_read_seqcount_latch(seqcount_t *s)
+ {
+ 	/* Pairs with the first smp_wmb() in raw_write_seqcount_latch() */
+-	int seq = READ_ONCE(s->sequence); /* ^^^ */
++	int seq;
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, seq_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) s
++	);
++#endif
++
++	seq = READ_ONCE(s->sequence); /* ^^^ */
+ 	return seq;
+ }
+ 
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index f7c561c4dcdd..01db9a4c465a 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1001,6 +1001,11 @@ asmlinkage long sys_pidfd_send_signal(int pidfd, int sig,
+ 				       siginfo_t __user *info,
+ 				       unsigned int flags);
+ 
++/*
++ * DART syscalls
++ */
++asmlinkage long sys_dart(unsigned long cmd, unsigned long arg);
++
+ /*
+  * Architecture-specific system calls
+  */
+diff --git a/include/linux/wait.h b/include/linux/wait.h
+index 3eb7cae8206c..e3d5661fa6c6 100644
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@ -11,6 +11,10 @@
+ #include <asm/current.h>
+ #include <uapi/linux/wait.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ typedef struct wait_queue_entry wait_queue_entry_t;
+ 
+ typedef int (*wait_queue_func_t)(struct wait_queue_entry *wq_entry, unsigned mode, int flags, void *key);
+@@ -123,7 +127,16 @@ init_waitqueue_func_entry(struct wait_queue_entry *wq_entry, wait_queue_func_t f
+  */
+ static inline int waitqueue_active(struct wait_queue_head *wq_head)
+ {
+-	return !list_empty(&wq_head->head);
++	int res = !list_empty(&wq_head->head);
++#ifdef CONFIG_DART
++	if (!res) {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) wq_head
++		);
++	}
++#endif
++	return res;
+ }
+ 
+ /**
+@@ -166,6 +179,13 @@ extern void remove_wait_queue(struct wait_queue_head *wq_head, struct wait_queue
+ 
+ static inline void __add_wait_queue(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, wait_arrive,
++			DART_FLAG_NONE, (hval_64_t) wq_entry,
++			(data_64_t) (wq_entry->func), (data_64_t) wq_head
++	);
++#endif
+ 	list_add(&wq_entry->entry, &wq_head->head);
+ }
+ 
+@@ -181,6 +201,13 @@ __add_wait_queue_exclusive(struct wait_queue_head *wq_head, struct wait_queue_en
+ 
+ static inline void __add_wait_queue_entry_tail(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, wait_arrive,
++			DART_FLAG_NONE, (hval_64_t) wq_entry,
++			(data_64_t) (wq_entry->func), (data_64_t) wq_head
++	);
++#endif
+ 	list_add_tail(&wq_entry->entry, &wq_head->head);
+ }
+ 
+@@ -195,6 +222,13 @@ static inline void
+ __remove_wait_queue(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
+ {
+ 	list_del(&wq_entry->entry);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, wait_pass,
++			DART_FLAG_NONE, (hval_64_t) wq_entry,
++			(data_64_t) (wq_entry->func)
++	);
++#endif
+ }
+ 
+ void __wake_up(struct wait_queue_head *wq_head, unsigned int mode, int nr, void *key);
+@@ -244,6 +278,16 @@ void __wake_up_sync(struct wait_queue_head *wq_head, unsigned int mode, int nr);
+ 
+ extern void init_wait_entry(struct wait_queue_entry *wq_entry, int flags);
+ 
++#ifdef CONFIG_DART
++#define DART_QUEUE_ARRIVE(head) \
++	DART_FUNC_LIB_CALL_WRAP( \
++			event, queue_arrive, \
++			DART_FLAG_NONE, (hval_64_t) (&(head)) \
++	);
++#else
++#define DART_QUEUE_ARRIVE(head)
++#endif
++
+ /*
+  * The below macro ___wait_event() has an explicit shadow of the __ret
+  * variable when used from the wait_event_*() macros.
+@@ -299,9 +343,12 @@ __out:	__ret;									\
+ #define wait_event(wq_head, condition)						\
+ do {										\
+ 	might_sleep();								\
+-	if (condition)								\
++	if (condition) {							\
++		DART_QUEUE_ARRIVE(wq_head); 					\
+ 		break;								\
++	}									\
+ 	__wait_event(wq_head, condition);					\
++	DART_QUEUE_ARRIVE(wq_head);						\
+ } while (0)
+ 
+ #define __io_wait_event(wq_head, condition)					\
+@@ -314,9 +361,12 @@ do {										\
+ #define io_wait_event(wq_head, condition)					\
+ do {										\
+ 	might_sleep();								\
+-	if (condition)								\
++	if (condition) {							\
++		DART_QUEUE_ARRIVE(wq_head); 					\
+ 		break;								\
++	}									\
+ 	__io_wait_event(wq_head, condition);					\
++	DART_QUEUE_ARRIVE(wq_head);						\
+ } while (0)
+ 
+ #define __wait_event_freezable(wq_head, condition)				\
+@@ -341,6 +391,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		__ret = __wait_event_freezable(wq_head, condition);		\
++	if (!__ret) {								\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -374,6 +427,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!___wait_cond_timeout(condition))					\
+ 		__ret = __wait_event_timeout(wq_head, condition, timeout);	\
++	if (__ret) {								\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -392,6 +448,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!___wait_cond_timeout(condition))					\
+ 		__ret = __wait_event_freezable_timeout(wq_head, condition, timeout); \
++	if (__ret > 0) {								\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -403,9 +462,12 @@ do {										\
+  */
+ #define wait_event_exclusive_cmd(wq_head, condition, cmd1, cmd2)		\
+ do {										\
+-	if (condition)								\
++	if (condition) {							\
++		DART_QUEUE_ARRIVE(wq_head);					\
+ 		break;								\
++	}									\
+ 	__wait_event_exclusive_cmd(wq_head, condition, cmd1, cmd2);		\
++	DART_QUEUE_ARRIVE(wq_head); 						\
+ } while (0)
+ 
+ #define __wait_event_cmd(wq_head, condition, cmd1, cmd2)			\
+@@ -428,9 +490,12 @@ do {										\
+  */
+ #define wait_event_cmd(wq_head, condition, cmd1, cmd2)				\
+ do {										\
+-	if (condition)								\
++	if (condition) {							\
++		DART_QUEUE_ARRIVE(wq_head);					\
+ 		break;								\
++	}									\
+ 	__wait_event_cmd(wq_head, condition, cmd1, cmd2);			\
++	DART_QUEUE_ARRIVE(wq_head);						\
+ } while (0)
+ 
+ #define __wait_event_interruptible(wq_head, condition)				\
+@@ -458,6 +523,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		__ret = __wait_event_interruptible(wq_head, condition);		\
++	if (!__ret) {								\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -493,6 +561,9 @@ do {										\
+ 	if (!___wait_cond_timeout(condition))					\
+ 		__ret = __wait_event_interruptible_timeout(wq_head,		\
+ 						condition, timeout);		\
++	if (__ret > 0) {							\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -582,6 +653,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		__ret = __wait_event_interruptible_exclusive(wq, condition);	\
++	if (!__ret) {								\
++		DART_QUEUE_ARRIVE(wq);						\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -595,6 +669,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		__ret = __wait_event_killable_exclusive(wq, condition);		\
++	if (!__ret) {								\
++		DART_QUEUE_ARRIVE(wq);						\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -609,6 +686,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		__ret = __wait_event_freezable_exclusive(wq, condition);	\
++	if (!__ret) {								\
++		DART_QUEUE_ARRIVE(wq);						\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -630,6 +710,7 @@ do {										\
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		___wait_event(wq_head, condition, TASK_IDLE, 0, 0, schedule());	\
++	DART_QUEUE_ARRIVE(wq_head);						\
+ } while (0)
+ 
+ /**
+@@ -654,6 +735,7 @@ do {										\
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		___wait_event(wq_head, condition, TASK_IDLE, 1, 0, schedule());	\
++	DART_QUEUE_ARRIVE(wq_head);						\
+ } while (0)
+ 
+ #define __wait_event_idle_timeout(wq_head, condition, timeout)			\
+@@ -686,6 +768,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!___wait_cond_timeout(condition))					\
+ 		__ret = __wait_event_idle_timeout(wq_head, condition, timeout);	\
++	if (__ret) {								\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -723,6 +808,9 @@ do {										\
+ 	might_sleep();								\
+ 	if (!___wait_cond_timeout(condition))					\
+ 		__ret = __wait_event_idle_exclusive_timeout(wq_head, condition, timeout);\
++	if (__ret) {								\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -887,6 +975,9 @@ extern int do_wait_intr_irq(wait_queue_head_t *, wait_queue_entry_t *);
+ 	might_sleep();								\
+ 	if (!(condition))							\
+ 		__ret = __wait_event_killable(wq_head, condition);		\
++	if (!__ret) {								\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+@@ -924,6 +1015,9 @@ extern int do_wait_intr_irq(wait_queue_head_t *, wait_queue_entry_t *);
+ 	if (!___wait_cond_timeout(condition))					\
+ 		__ret = __wait_event_killable_timeout(wq_head,			\
+ 						condition, timeout);		\
++	if (__ret > 0) {							\
++		DART_QUEUE_ARRIVE(wq_head);					\
++	}									\
+ 	__ret;									\
+ })
+ 
+diff --git a/include/linux/wait_bit.h b/include/linux/wait_bit.h
+index 7dec36aecbd9..ac7b69a495ce 100644
+--- a/include/linux/wait_bit.h
++++ b/include/linux/wait_bit.h
+@@ -7,6 +7,10 @@
+  */
+ #include <linux/wait.h>
+ 
++#ifdef CONFIG_DART
++#include <dart_kernel.h>
++#endif
++
+ struct wait_bit_key {
+ 	void			*flags;
+ 	int			bit_nr;
+@@ -51,6 +55,21 @@ extern int bit_wait_io(struct wait_bit_key *key, int mode);
+ extern int bit_wait_timeout(struct wait_bit_key *key, int mode);
+ extern int bit_wait_io_timeout(struct wait_bit_key *key, int mode);
+ 
++#ifdef CONFIG_DART
++#define DART_QUEUE_ARRIVE_WAIT_BIT(word, bit) \
++	DART_FUNC_LIB_CALL_WRAP( \
++			event, queue_arrive, \
++			DART_FLAG_NONE, _CANTOR_PAIR( \
++				(unsigned long) (word), (unsigned long) (bit) \
++			) \
++	)
++#define DART_QUEUE_ARRIVE_WAIT_VAR(var) \
++	DART_QUEUE_ARRIVE_WAIT_BIT(var, (-1))
++#else
++#define DART_QUEUE_ARRIVE_WAIT_BIT(word, bit)
++#define DART_QUEUE_ARRIVE_WAIT_VAR(var)
++#endif
++
+ /**
+  * wait_on_bit - wait for a bit to be cleared
+  * @word: the word being waited on, a kernel virtual address
+@@ -70,12 +89,17 @@ extern int bit_wait_io_timeout(struct wait_bit_key *key, int mode);
+ static inline int
+ wait_on_bit(unsigned long *word, int bit, unsigned mode)
+ {
++	int retv;
+ 	might_sleep();
+-	if (!test_bit(bit, word))
++	if (!test_bit(bit, word)) {
++		DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
+ 		return 0;
+-	return out_of_line_wait_on_bit(word, bit,
++	}
++	retv = out_of_line_wait_on_bit(word, bit,
+ 				       bit_wait,
+ 				       mode);
++	DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
++	return retv;
+ }
+ 
+ /**
+@@ -95,12 +119,17 @@ wait_on_bit(unsigned long *word, int bit, unsigned mode)
+ static inline int
+ wait_on_bit_io(unsigned long *word, int bit, unsigned mode)
+ {
++	int retv;
+ 	might_sleep();
+-	if (!test_bit(bit, word))
++	if (!test_bit(bit, word)) {
++		DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
+ 		return 0;
+-	return out_of_line_wait_on_bit(word, bit,
++	}
++	retv = out_of_line_wait_on_bit(word, bit,
+ 				       bit_wait_io,
+ 				       mode);
++	DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
++	return retv;
+ }
+ 
+ /**
+@@ -122,12 +151,17 @@ static inline int
+ wait_on_bit_timeout(unsigned long *word, int bit, unsigned mode,
+ 		    unsigned long timeout)
+ {
++	int retv;
+ 	might_sleep();
+-	if (!test_bit(bit, word))
++	if (!test_bit(bit, word)) {
++		DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
+ 		return 0;
+-	return out_of_line_wait_on_bit_timeout(word, bit,
++	}
++	retv = out_of_line_wait_on_bit_timeout(word, bit,
+ 					       bit_wait_timeout,
+ 					       mode, timeout);
++	DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
++	return retv;
+ }
+ 
+ /**
+@@ -150,10 +184,15 @@ static inline int
+ wait_on_bit_action(unsigned long *word, int bit, wait_bit_action_f *action,
+ 		   unsigned mode)
+ {
++	int retv;
+ 	might_sleep();
+-	if (!test_bit(bit, word))
++	if (!test_bit(bit, word)) {
++		DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
+ 		return 0;
+-	return out_of_line_wait_on_bit(word, bit, action, mode);
++	}
++	retv = out_of_line_wait_on_bit(word, bit, action, mode);
++	DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
++	return retv;
+ }
+ 
+ /**
+@@ -178,10 +217,15 @@ wait_on_bit_action(unsigned long *word, int bit, wait_bit_action_f *action,
+ static inline int
+ wait_on_bit_lock(unsigned long *word, int bit, unsigned mode)
+ {
++	int retv;
+ 	might_sleep();
+-	if (!test_and_set_bit(bit, word))
++	if (!test_and_set_bit(bit, word)) {
++		DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
+ 		return 0;
+-	return out_of_line_wait_on_bit_lock(word, bit, bit_wait, mode);
++	}
++	retv = out_of_line_wait_on_bit_lock(word, bit, bit_wait, mode);
++	DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
++	return retv;
+ }
+ 
+ /**
+@@ -202,10 +246,15 @@ wait_on_bit_lock(unsigned long *word, int bit, unsigned mode)
+ static inline int
+ wait_on_bit_lock_io(unsigned long *word, int bit, unsigned mode)
+ {
++	int retv;
+ 	might_sleep();
+-	if (!test_and_set_bit(bit, word))
++	if (!test_and_set_bit(bit, word)) {
++		DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
+ 		return 0;
+-	return out_of_line_wait_on_bit_lock(word, bit, bit_wait_io, mode);
++	}
++	retv = out_of_line_wait_on_bit_lock(word, bit, bit_wait_io, mode);
++	DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
++	return retv;
+ }
+ 
+ /**
+@@ -229,10 +278,15 @@ static inline int
+ wait_on_bit_lock_action(unsigned long *word, int bit, wait_bit_action_f *action,
+ 			unsigned mode)
+ {
++	int retv;
+ 	might_sleep();
+-	if (!test_and_set_bit(bit, word))
++	if (!test_and_set_bit(bit, word)) {
++		DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
+ 		return 0;
+-	return out_of_line_wait_on_bit_lock(word, bit, action, mode);
++	}
++	retv = out_of_line_wait_on_bit_lock(word, bit, action, mode);
++	DART_QUEUE_ARRIVE_WAIT_BIT(word, bit);
++	return retv;
+ }
+ 
+ extern void init_wait_var_entry(struct wait_bit_queue_entry *wbq_entry, void *var, int flags);
+@@ -273,9 +327,12 @@ __out:	__ret;								\
+ #define wait_var_event(var, condition)					\
+ do {									\
+ 	might_sleep();							\
+-	if (condition)							\
++	if (condition) {						\
++		DART_QUEUE_ARRIVE_WAIT_VAR(var);			\
+ 		break;							\
++	}								\
+ 	__wait_var_event(var, condition);				\
++	DART_QUEUE_ARRIVE_WAIT_VAR(var);				\
+ } while (0)
+ 
+ #define __wait_var_event_killable(var, condition)			\
+@@ -288,6 +345,9 @@ do {									\
+ 	might_sleep();							\
+ 	if (!(condition))						\
+ 		__ret = __wait_var_event_killable(var, condition);	\
++	if (!__ret) {							\
++		DART_QUEUE_ARRIVE_WAIT_VAR(var);			\
++	}								\
+ 	__ret;								\
+ })
+ 
+@@ -302,6 +362,9 @@ do {									\
+ 	might_sleep();							\
+ 	if (!___wait_cond_timeout(condition))				\
+ 		__ret = __wait_var_event_timeout(var, condition, timeout); \
++	if (__ret) {							\
++		DART_QUEUE_ARRIVE_WAIT_VAR(var);			\
++	}								\
+ 	__ret;								\
+ })
+ 
+@@ -315,6 +378,9 @@ do {									\
+ 	might_sleep();							\
+ 	if (!(condition))						\
+ 		__ret = __wait_var_event_interruptible(var, condition);	\
++	if (!__ret) {							\
++		DART_QUEUE_ARRIVE_WAIT_VAR(var);			\
++	}								\
+ 	__ret;								\
+ })
+ 
+diff --git a/kernel/configs/check_kasan.config b/kernel/configs/check_kasan.config
+new file mode 100644
+index 000000000000..807551a07355
+--- /dev/null
++++ b/kernel/configs/check_kasan.config
+@@ -0,0 +1,4 @@
++CONFIG_KASAN=y
++CONFIG_KASAN_GENERIC=y
++CONFIG_KASAN_OUTLINE=y
++CONFIG_KASAN_STACK_ENABLE=y
+diff --git a/kernel/configs/check_ktsan.config b/kernel/configs/check_ktsan.config
+new file mode 100644
+index 000000000000..e361a9d8c486
+--- /dev/null
++++ b/kernel/configs/check_ktsan.config
+@@ -0,0 +1 @@
++CONFIG_KTSAN=y
+diff --git a/kernel/configs/check_lockdep.config b/kernel/configs/check_lockdep.config
+new file mode 100644
+index 000000000000..238270e31bb0
+--- /dev/null
++++ b/kernel/configs/check_lockdep.config
+@@ -0,0 +1,28 @@
++# lockups and hangs
++CONFIG_LOCKUP_DETECTOR=y
++
++CONFIG_SOFTLOCKUP_DETECTOR=y
++CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=y
++CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC_VALUE=1
++
++CONFIG_HARDLOCKUP_DETECTOR=y
++CONFIG_HARDLOCKUP_DETECTOR_PERF=y
++CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=y
++CONFIG_BOOTPARAM_HARDLOCKUP_PANIC_VALUE=1
++
++CONFIG_DETECT_HUNG_TASK=y
++CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=20
++CONFIG_BOOTPARAM_HUNG_TASK_PANIC=y
++CONFIG_BOOTPARAM_HUNG_TASK_PANIC_VALUE=1
++
++# lockdep
++CONFIG_LOCKDEP=y
++CONFIG_PROVE_LOCKING=y
++CONFIG_PROVE_RCU=y
++CONFIG_DEBUG_RT_MUTEXES=y
++CONFIG_DEBUG_SPINLOCK=y
++CONFIG_DEBUG_MUTEXES=y
++CONFIG_DEBUG_WW_MUTEX_SLOWPATH=y
++CONFIG_DEBUG_RWSEMS=y
++CONFIG_DEBUG_LOCK_ALLOC=y
++CONFIG_DEBUG_ATOMIC_SLEEP=y
+diff --git a/kernel/configs/dart.config b/kernel/configs/dart.config
+new file mode 100644
+index 000000000000..c42838560c70
+--- /dev/null
++++ b/kernel/configs/dart.config
+@@ -0,0 +1 @@
++CONFIG_DART=y
+diff --git a/kernel/configs/dart_devel.config b/kernel/configs/dart_devel.config
+new file mode 100644
+index 000000000000..c0358103acd4
+--- /dev/null
++++ b/kernel/configs/dart_devel.config
+@@ -0,0 +1,2 @@
++CONFIG_DART=y
++CONFIG_DART_DEVEL=y
+diff --git a/kernel/configs/qemu_guest.config b/kernel/configs/qemu_guest.config
+new file mode 100644
+index 000000000000..316391124880
+--- /dev/null
++++ b/kernel/configs/qemu_guest.config
+@@ -0,0 +1,7 @@
++# enable the pvpanic device
++CONFIG_PVPANIC=y
++
++# enable the ivshmem device
++CONFIG_PCI=y
++CONFIG_UIO=y
++CONFIG_IVSHMEM=m
+diff --git a/kernel/configs/racer_btrfs.config b/kernel/configs/racer_btrfs.config
+new file mode 100644
+index 000000000000..fbb6a50198d9
+--- /dev/null
++++ b/kernel/configs/racer_btrfs.config
+@@ -0,0 +1,7 @@
++CONFIG_BTRFS_FS=m
++CONFIG_BTRFS_FS_POSIX_ACL=y
++CONFIG_BTRFS_FS_CHECK_INTEGRITY=y
++CONFIG_BTRFS_FS_RUN_SANITY_TESTS=n
++CONFIG_BTRFS_DEBUG=y
++CONFIG_BTRFS_ASSERT=y
++CONFIG_BTRFS_FS_REF_VERIFY=y
+diff --git a/kernel/configs/racer_ext4.config b/kernel/configs/racer_ext4.config
+new file mode 100644
+index 000000000000..1020a6ee1e75
+--- /dev/null
++++ b/kernel/configs/racer_ext4.config
+@@ -0,0 +1,7 @@
++CONFIG_EXT4_FS=m
++CONFIG_EXT4_USE_FOR_EXT2=y
++CONFIG_EXT4_FS_POSIX_ACL=y
++CONFIG_EXT4_FS_SECURITY=y
++CONFIG_EXT4_DEBUG=y
++CONFIG_JBD2=y
++CONFIG_JBD2_DEBUG=y
+diff --git a/kernel/configs/racer_xfs.config b/kernel/configs/racer_xfs.config
+new file mode 100644
+index 000000000000..61b5f533cf50
+--- /dev/null
++++ b/kernel/configs/racer_xfs.config
+@@ -0,0 +1,8 @@
++CONFIG_XFS_FS=m
++CONFIG_XFS_QUOTA=y
++CONFIG_XFS_POSIX_ACL=y
++CONFIG_XFS_RT=y
++CONFIG_XFS_ONLINE_SCRUB=y
++CONFIG_XFS_ONLINE_REPAIR=y
++CONFIG_XFS_DEBUG=y
++CONFIG_XFS_ASSERT_FATAL=y
+diff --git a/kernel/kthread.c b/kernel/kthread.c
+index b262f47046ca..70165938f4f9 100644
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -25,6 +25,10 @@
+ #include <linux/numa.h>
+ #include <trace/events/sched.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ static DEFINE_SPINLOCK(kthread_create_lock);
+ static LIST_HEAD(kthread_create_list);
+ struct task_struct *kthreadd_task;
+@@ -221,6 +225,10 @@ static int kthread(void *_create)
+ 	struct kthread *self;
+ 	int ret;
+ 
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
++
+ 	self = kzalloc(sizeof(*self), GFP_KERNEL);
+ 	set_kthread_struct(self);
+ 
+@@ -252,7 +260,29 @@ static int kthread(void *_create)
+ 	if (!test_bit(KTHREAD_SHOULD_STOP, &self->flags)) {
+ 		cgroup_kthread_ready();
+ 		__kthread_parkme(self);
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, krun_enter,
++					DART_FLAG_NONE, (hval_64_t) create,
++					(data_64_t) threadfn
++			);
++			dart_switch_rel_meta();
++		}
++#endif
+ 		ret = threadfn(data);
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, krun_exit,
++					DART_FLAG_NONE, (hval_64_t) create,
++					(data_64_t) threadfn
++			);
++			dart_switch_rel_meta();
++		}
++#endif
+ 	}
+ 	do_exit(ret);
+ }
+@@ -308,6 +338,13 @@ struct task_struct *__kthread_create_on_node(int (*threadfn)(void *data),
+ 	create->done = &done;
+ 
+ 	spin_lock(&kthread_create_lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, krun_register,
++			DART_FLAG_NONE, (hval_64_t) create,
++			(data_64_t) threadfn
++	);
++#endif
+ 	list_add_tail(&create->list, &kthread_create_list);
+ 	spin_unlock(&kthread_create_lock);
+ 
+@@ -634,6 +671,10 @@ int kthread_worker_fn(void *worker_ptr)
+ {
+ 	struct kthread_worker *worker = worker_ptr;
+ 	struct kthread_work *work;
++#ifdef CONFIG_DART
++	bool __dart;
++	kthread_work_func_t __current_func;
++#endif
+ 
+ 	/*
+ 	 * FIXME: Update the check and remove the assignment when all kthread
+@@ -664,11 +705,60 @@ int kthread_worker_fn(void *worker_ptr)
+ 		list_del_init(&work->node);
+ 	}
+ 	worker->current_work = work;
++#ifdef CONFIG_DART
++		if (work) {
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				__current_func = work->func;  /* in case work is freed */
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, work_enter,
++						DART_FLAG_NONE, (hval_64_t) worker->current_work,
++						(data_64_t) __current_func
++				);
++				dart_switch_rel_meta();
++				/* pair with the queue_notify even in queue_work() */
++				DART_FUNC_LIB_CALL_WRAP(
++						event, queue_arrive,
++						DART_FLAG_NONE, (hval_64_t) (&work->node)
++				);
++				/* woke up too early, delay tracing until actual call */
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, background,
++						DART_FLAG_NONE, (hval_64_t) worker->current_work
++				);
++			}
++		}
++#endif
++
+ 	raw_spin_unlock_irq(&worker->lock);
+ 
+ 	if (work) {
+ 		__set_current_state(TASK_RUNNING);
++#ifdef CONFIG_DART
++		if (__dart) {
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, foreground,
++					DART_FLAG_NONE, (hval_64_t) worker->current_work
++			);
++		}
++#endif
+ 		work->func(work);
++#ifdef CONFIG_DART
++		/* pair with the queue_arrive event in kthread_flush_work() */
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) worker->current_work
++		);
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, work_exit,
++					DART_FLAG_NONE, (hval_64_t) worker->current_work,
++					(data_64_t) __current_func
++			);
++			dart_switch_rel_meta();
++		}
++#endif
+ 	} else if (!freezing(current))
+ 		schedule();
+ 
+@@ -797,6 +887,14 @@ static void kthread_insert_work(struct kthread_worker *worker,
+ {
+ 	kthread_insert_work_sanity_check(worker, work);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, work_register,
++			DART_FLAG_NONE, (hval_64_t) work,
++			(data_64_t) work->func
++	);
++#endif
++
+ 	list_add_tail(&work->node, pos);
+ 	work->worker = worker;
+ 	if (!worker->current_work && likely(worker->task))
+@@ -826,6 +924,14 @@ bool kthread_queue_work(struct kthread_worker *worker,
+ 		kthread_insert_work(worker, work, &worker->work_list);
+ 		ret = true;
+ 	}
++#ifdef CONFIG_DART
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&work->node)
++		);
++	}
++#endif
+ 	raw_spin_unlock_irqrestore(&worker->lock, flags);
+ 	return ret;
+ }
+@@ -924,6 +1030,14 @@ bool kthread_queue_delayed_work(struct kthread_worker *worker,
+ 		__kthread_queue_delayed_work(worker, dwork, delay);
+ 		ret = true;
+ 	}
++#ifdef CONFIG_DART
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&work->node)
++		);
++	}
++#endif
+ 
+ 	raw_spin_unlock_irqrestore(&worker->lock, flags);
+ 	return ret;
+@@ -970,8 +1084,15 @@ void kthread_flush_work(struct kthread_work *work)
+ 	else if (worker->current_work == work)
+ 		kthread_insert_work(worker, &fwork.work,
+ 				    worker->work_list.next);
+-	else
++	else {
+ 		noop = true;
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, (hval_64_t) work
++		);
++#endif
++	}
+ 
+ 	raw_spin_unlock_irq(&worker->lock);
+ 
+@@ -1018,6 +1139,23 @@ static bool __kthread_cancel_work(struct kthread_work *work, bool is_dwork,
+ 	 */
+ 	if (!list_empty(&work->node)) {
+ 		list_del_init(&work->node);
++
++#ifdef CONFIG_DART
++		if (!is_dwork) {
++			/*
++			 * delayed_work is cancelled by cancelling the timer,
++			 * i.e., by the del_timer_sync function above,
++			 * it is not in queue yet and thus, cancelling again here
++			 * will cause trouble
++			 */
++			DART_FUNC_LIB_CALL_WRAP(
++					async, work_cancel,
++					DART_FLAG_NONE, (hval_64_t) work,
++					(data_64_t) (work->func)
++			);
++		}
++#endif
++
+ 		return true;
+ 	}
+ 
+diff --git a/kernel/locking/mutex.c b/kernel/locking/mutex.c
+index 468a9b8422e3..614ffdce91d2 100644
+--- a/kernel/locking/mutex.c
++++ b/kernel/locking/mutex.c
+@@ -30,6 +30,10 @@
+ #include <linux/debug_locks.h>
+ #include <linux/osq_lock.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #ifdef CONFIG_DEBUG_MUTEXES
+ # include "mutex-debug.h"
+ #else
+@@ -733,6 +737,14 @@ static noinline void __sched __mutex_unlock_slowpath(struct mutex *lock, unsigne
+  */
+ void __sched mutex_unlock(struct mutex *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
++
+ #ifndef CONFIG_DEBUG_LOCK_ALLOC
+ 	if (__mutex_unlock_fast(lock))
+ 		return;
+@@ -1100,7 +1112,17 @@ static int __sched
+ __mutex_lock(struct mutex *lock, long state, unsigned int subclass,
+ 	     struct lockdep_map *nest_lock, unsigned long ip)
+ {
+-	return __mutex_lock_common(lock, state, subclass, nest_lock, ip, NULL, false);
++	int r = __mutex_lock_common(lock, state, subclass, nest_lock, ip, NULL, false);
++#ifdef CONFIG_DART
++	if (r == 0) {
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(1, 1, 1), 0,
++				(data_64_t) lock
++		);
++	}
++#endif
++	return r;
+ }
+ 
+ static int __sched
+@@ -1145,12 +1167,22 @@ void __sched
+ mutex_lock_io_nested(struct mutex *lock, unsigned int subclass)
+ {
+ 	int token;
++	int r;
+ 
+ 	might_sleep();
+ 
+ 	token = io_schedule_prepare();
+-	__mutex_lock_common(lock, TASK_UNINTERRUPTIBLE,
++	r = __mutex_lock_common(lock, TASK_UNINTERRUPTIBLE,
+ 			    subclass, NULL, _RET_IP_, NULL, 0);
++#ifdef CONFIG_DART
++	if (r == 0) {
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(1, 1, 1), 0,
++				(data_64_t) lock
++		);
++	}
++#endif
+ 	io_schedule_finish(token);
+ }
+ EXPORT_SYMBOL_GPL(mutex_lock_io_nested);
+@@ -1416,6 +1448,15 @@ int __sched mutex_trylock(struct mutex *lock)
+ #endif
+ 
+ 	locked = __mutex_trylock(lock);
++#ifdef CONFIG_DART
++	if (locked) {
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(1, 1, 1), 0,
++				(data_64_t) lock
++		);
++	}
++#endif
+ 	if (locked)
+ 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
+ 
+diff --git a/kernel/locking/percpu-rwsem.c b/kernel/locking/percpu-rwsem.c
+index 364d38a0c444..e2b22be8d46f 100644
+--- a/kernel/locking/percpu-rwsem.c
++++ b/kernel/locking/percpu-rwsem.c
+@@ -10,6 +10,10 @@
+ 
+ #include "rwsem.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ int __percpu_init_rwsem(struct percpu_rw_semaphore *sem,
+ 			const char *name, struct lock_class_key *rwsem_key)
+ {
+@@ -163,11 +167,27 @@ void percpu_down_write(struct percpu_rw_semaphore *sem)
+ 
+ 	/* Wait for all now active readers to complete. */
+ 	rcuwait_wait_event(&sem->writer, readers_active_check(sem));
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
+ }
+ EXPORT_SYMBOL_GPL(percpu_down_write);
+ 
+ void percpu_up_write(struct percpu_rw_semaphore *sem)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
++
+ 	/*
+ 	 * Signal the writer is done, no fast path yet.
+ 	 *
+diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c
+index eef04551eae7..4eb322cdbc8e 100644
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@ -31,6 +31,10 @@
+ #include "rwsem.h"
+ #include "lock_events.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /*
+  * The least significant 3 bits of the owner value has the following
+  * meanings when set.
+@@ -1346,6 +1350,13 @@ inline void __down_read(struct rw_semaphore *sem)
+ 	} else {
+ 		rwsem_set_reader_owned(sem);
+ 	}
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
+ }
+ 
+ static inline int __down_read_killable(struct rw_semaphore *sem)
+@@ -1357,6 +1368,13 @@ static inline int __down_read_killable(struct rw_semaphore *sem)
+ 	} else {
+ 		rwsem_set_reader_owned(sem);
+ 	}
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
+ 	return 0;
+ }
+ 
+@@ -1374,6 +1392,13 @@ static inline int __down_read_trylock(struct rw_semaphore *sem)
+ 		if (atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
+ 					tmp + RWSEM_READER_BIAS)) {
+ 			rwsem_set_reader_owned(sem);
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					sync, gen_lock,
++					_DART_FLAG_SYNC(0, 1, 1), 0,
++					(data_64_t) sem
++			);
++#endif
+ 			return 1;
+ 		}
+ 	} while (!(tmp & RWSEM_READ_FAILED_MASK));
+@@ -1392,6 +1417,13 @@ static inline void __down_write(struct rw_semaphore *sem)
+ 		rwsem_down_write_slowpath(sem, TASK_UNINTERRUPTIBLE);
+ 	else
+ 		rwsem_set_owner(sem);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
+ }
+ 
+ static inline int __down_write_killable(struct rw_semaphore *sem)
+@@ -1405,6 +1437,13 @@ static inline int __down_write_killable(struct rw_semaphore *sem)
+ 	} else {
+ 		rwsem_set_owner(sem);
+ 	}
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
+ 	return 0;
+ }
+ 
+@@ -1418,6 +1457,13 @@ static inline int __down_write_trylock(struct rw_semaphore *sem)
+ 	if (atomic_long_try_cmpxchg_acquire(&sem->count, &tmp,
+ 					    RWSEM_WRITER_LOCKED)) {
+ 		rwsem_set_owner(sem);
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(1, 1, 1), 0,
++				(data_64_t) sem
++		);
++#endif
+ 		return true;
+ 	}
+ 	return false;
+@@ -1433,6 +1479,14 @@ inline void __up_read(struct rw_semaphore *sem)
+ 	DEBUG_RWSEMS_WARN_ON(sem->magic != sem, sem);
+ 	DEBUG_RWSEMS_WARN_ON(!is_rwsem_reader_owned(sem), sem);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
++
+ 	rwsem_clear_reader_owned(sem);
+ 	tmp = atomic_long_add_return_release(-RWSEM_READER_BIAS, &sem->count);
+ 	DEBUG_RWSEMS_WARN_ON(tmp < 0, sem);
+@@ -1458,6 +1512,14 @@ static inline void __up_write(struct rw_semaphore *sem)
+ 	DEBUG_RWSEMS_WARN_ON((rwsem_owner(sem) != current) &&
+ 			    !rwsem_test_oflags(sem, RWSEM_NONSPINNABLE), sem);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
++
+ 	rwsem_clear_owner(sem);
+ 	tmp = atomic_long_fetch_add_release(-RWSEM_WRITER_LOCKED, &sem->count);
+ 	if (unlikely(tmp & RWSEM_FLAG_WAITERS))
+@@ -1471,6 +1533,14 @@ static inline void __downgrade_write(struct rw_semaphore *sem)
+ {
+ 	long tmp;
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
++
+ 	/*
+ 	 * When downgrading from exclusive to shared ownership,
+ 	 * anything inside the write-locked region cannot leak
+@@ -1482,6 +1552,16 @@ static inline void __downgrade_write(struct rw_semaphore *sem)
+ 	tmp = atomic_long_fetch_add_release(
+ 		-RWSEM_WRITER_LOCKED+RWSEM_READER_BIAS, &sem->count);
+ 	rwsem_set_reader_owned(sem);
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) sem
++	);
++#endif
++
++
+ 	if (tmp & RWSEM_FLAG_WAITERS)
+ 		rwsem_downgrade_wake(sem);
+ }
+diff --git a/kernel/locking/semaphore.c b/kernel/locking/semaphore.c
+index d9dd94defc0a..fd2130c5fa79 100644
+--- a/kernel/locking/semaphore.c
++++ b/kernel/locking/semaphore.c
+@@ -33,6 +33,10 @@
+ #include <linux/spinlock.h>
+ #include <linux/ftrace.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ static noinline void __down(struct semaphore *sem);
+ static noinline int __down_interruptible(struct semaphore *sem);
+ static noinline int __down_killable(struct semaphore *sem);
+@@ -206,6 +210,14 @@ static inline int __sched __down_common(struct semaphore *sem, long state,
+ {
+ 	struct semaphore_waiter waiter;
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, sema_arrive,
++			DART_FLAG_NONE, (hval_64_t) (&waiter),
++			(data_64_t) sem, (data_64_t) (&sem->wait_list)
++	);
++#endif
++
+ 	list_add_tail(&waiter.list, &sem->wait_list);
+ 	waiter.task = current;
+ 	waiter.up = false;
+@@ -219,16 +231,38 @@ static inline int __sched __down_common(struct semaphore *sem, long state,
+ 		raw_spin_unlock_irq(&sem->lock);
+ 		timeout = schedule_timeout(timeout);
+ 		raw_spin_lock_irq(&sem->lock);
+-		if (waiter.up)
++		if (waiter.up) {
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					event, sema_pass,
++					DART_FLAG_NONE, (hval_64_t) (&waiter),
++					(data_64_t) sem
++			);
++#endif
+ 			return 0;
++		}
+ 	}
+ 
+  timed_out:
+ 	list_del(&waiter.list);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, sema_pass,
++			DART_FLAG_NONE, (&waiter),
++			(data_64_t) sem
++	);
++#endif
+ 	return -ETIME;
+ 
+  interrupted:
+ 	list_del(&waiter.list);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, sema_pass,
++			DART_FLAG_NONE, (hval_64_t) (&waiter),
++			(data_64_t) sem
++	);
++#endif
+ 	return -EINTR;
+ }
+ 
+@@ -256,7 +290,32 @@ static noinline void __sched __up(struct semaphore *sem)
+ {
+ 	struct semaphore_waiter *waiter = list_first_entry(&sem->wait_list,
+ 						struct semaphore_waiter, list);
++
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
++
+ 	list_del(&waiter->list);
+ 	waiter->up = true;
++#ifdef CONFIG_DART
++	__dart = dart_switch_acq_meta();
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				event, sema_notify_enter,
++				DART_FLAG_NONE, (hval_64_t) waiter,
++				(data_64_t) sem
++		);
++	}
++#endif
+ 	wake_up_process(waiter->task);
++#ifdef CONFIG_DART
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				event, sema_notify_exit,
++				DART_FLAG_NONE, (hval_64_t) waiter,
++				(data_64_t) sem
++		);
++		dart_switch_rel_meta();
++	}
++#endif
+ }
+diff --git a/kernel/locking/spinlock.c b/kernel/locking/spinlock.c
+index 0ff08380f531..e3693fcc5ab0 100644
+--- a/kernel/locking/spinlock.c
++++ b/kernel/locking/spinlock.c
+@@ -22,6 +22,10 @@
+ #include <linux/debug_locks.h>
+ #include <linux/export.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #ifdef CONFIG_MMIOWB
+ #ifndef arch_mmiowb_state
+ DEFINE_PER_CPU(struct mmiowb_state, __mmiowb_state);
+@@ -132,7 +136,17 @@ BUILD_LOCK_OPS(write, rwlock);
+ #ifndef CONFIG_INLINE_SPIN_TRYLOCK
+ int __lockfunc _raw_spin_trylock(raw_spinlock_t *lock)
+ {
+-	return __raw_spin_trylock(lock);
++	int r = __raw_spin_trylock(lock);
++#ifdef CONFIG_DART
++	if (r) {
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(1, 1, 1), 0,
++				(data_64_t) lock
++		);
++	}
++#endif
++	return r;
+ }
+ EXPORT_SYMBOL(_raw_spin_trylock);
+ #endif
+@@ -140,7 +154,17 @@ EXPORT_SYMBOL(_raw_spin_trylock);
+ #ifndef CONFIG_INLINE_SPIN_TRYLOCK_BH
+ int __lockfunc _raw_spin_trylock_bh(raw_spinlock_t *lock)
+ {
+-	return __raw_spin_trylock_bh(lock);
++	int r = __raw_spin_trylock_bh(lock);
++#ifdef CONFIG_DART
++	if (r) {
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(1, 1, 1), 0,
++				(data_64_t) lock
++		);
++	}
++#endif
++	return r;
+ }
+ EXPORT_SYMBOL(_raw_spin_trylock_bh);
+ #endif
+@@ -149,6 +173,13 @@ EXPORT_SYMBOL(_raw_spin_trylock_bh);
+ void __lockfunc _raw_spin_lock(raw_spinlock_t *lock)
+ {
+ 	__raw_spin_lock(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_spin_lock);
+ #endif
+@@ -156,7 +187,15 @@ EXPORT_SYMBOL(_raw_spin_lock);
+ #ifndef CONFIG_INLINE_SPIN_LOCK_IRQSAVE
+ unsigned long __lockfunc _raw_spin_lock_irqsave(raw_spinlock_t *lock)
+ {
+-	return __raw_spin_lock_irqsave(lock);
++	unsigned long r = __raw_spin_lock_irqsave(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
++	return r;
+ }
+ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
+ #endif
+@@ -165,6 +204,13 @@ EXPORT_SYMBOL(_raw_spin_lock_irqsave);
+ void __lockfunc _raw_spin_lock_irq(raw_spinlock_t *lock)
+ {
+ 	__raw_spin_lock_irq(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_spin_lock_irq);
+ #endif
+@@ -173,6 +219,13 @@ EXPORT_SYMBOL(_raw_spin_lock_irq);
+ void __lockfunc _raw_spin_lock_bh(raw_spinlock_t *lock)
+ {
+ 	__raw_spin_lock_bh(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_spin_lock_bh);
+ #endif
+@@ -180,6 +233,13 @@ EXPORT_SYMBOL(_raw_spin_lock_bh);
+ #ifdef CONFIG_UNINLINE_SPIN_UNLOCK
+ void __lockfunc _raw_spin_unlock(raw_spinlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_spin_unlock(lock);
+ }
+ EXPORT_SYMBOL(_raw_spin_unlock);
+@@ -188,6 +248,13 @@ EXPORT_SYMBOL(_raw_spin_unlock);
+ #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQRESTORE
+ void __lockfunc _raw_spin_unlock_irqrestore(raw_spinlock_t *lock, unsigned long flags)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_spin_unlock_irqrestore(lock, flags);
+ }
+ EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
+@@ -196,6 +263,13 @@ EXPORT_SYMBOL(_raw_spin_unlock_irqrestore);
+ #ifndef CONFIG_INLINE_SPIN_UNLOCK_IRQ
+ void __lockfunc _raw_spin_unlock_irq(raw_spinlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_spin_unlock_irq(lock);
+ }
+ EXPORT_SYMBOL(_raw_spin_unlock_irq);
+@@ -204,6 +278,13 @@ EXPORT_SYMBOL(_raw_spin_unlock_irq);
+ #ifndef CONFIG_INLINE_SPIN_UNLOCK_BH
+ void __lockfunc _raw_spin_unlock_bh(raw_spinlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_spin_unlock_bh(lock);
+ }
+ EXPORT_SYMBOL(_raw_spin_unlock_bh);
+@@ -212,7 +293,17 @@ EXPORT_SYMBOL(_raw_spin_unlock_bh);
+ #ifndef CONFIG_INLINE_READ_TRYLOCK
+ int __lockfunc _raw_read_trylock(rwlock_t *lock)
+ {
+-	return __raw_read_trylock(lock);
++	int r = __raw_read_trylock(lock);
++#ifdef CONFIG_DART
++	if (r) {
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(0, 1, 1), 0,
++				(data_64_t) lock
++		);
++	}
++#endif
++	return r;
+ }
+ EXPORT_SYMBOL(_raw_read_trylock);
+ #endif
+@@ -221,6 +312,13 @@ EXPORT_SYMBOL(_raw_read_trylock);
+ void __lockfunc _raw_read_lock(rwlock_t *lock)
+ {
+ 	__raw_read_lock(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_read_lock);
+ #endif
+@@ -228,7 +326,15 @@ EXPORT_SYMBOL(_raw_read_lock);
+ #ifndef CONFIG_INLINE_READ_LOCK_IRQSAVE
+ unsigned long __lockfunc _raw_read_lock_irqsave(rwlock_t *lock)
+ {
+-	return __raw_read_lock_irqsave(lock);
++	unsigned long r = __raw_read_lock_irqsave(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
++	return r;
+ }
+ EXPORT_SYMBOL(_raw_read_lock_irqsave);
+ #endif
+@@ -237,6 +343,13 @@ EXPORT_SYMBOL(_raw_read_lock_irqsave);
+ void __lockfunc _raw_read_lock_irq(rwlock_t *lock)
+ {
+ 	__raw_read_lock_irq(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_read_lock_irq);
+ #endif
+@@ -245,6 +358,13 @@ EXPORT_SYMBOL(_raw_read_lock_irq);
+ void __lockfunc _raw_read_lock_bh(rwlock_t *lock)
+ {
+ 	__raw_read_lock_bh(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_read_lock_bh);
+ #endif
+@@ -252,6 +372,13 @@ EXPORT_SYMBOL(_raw_read_lock_bh);
+ #ifndef CONFIG_INLINE_READ_UNLOCK
+ void __lockfunc _raw_read_unlock(rwlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_read_unlock(lock);
+ }
+ EXPORT_SYMBOL(_raw_read_unlock);
+@@ -260,6 +387,13 @@ EXPORT_SYMBOL(_raw_read_unlock);
+ #ifndef CONFIG_INLINE_READ_UNLOCK_IRQRESTORE
+ void __lockfunc _raw_read_unlock_irqrestore(rwlock_t *lock, unsigned long flags)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_read_unlock_irqrestore(lock, flags);
+ }
+ EXPORT_SYMBOL(_raw_read_unlock_irqrestore);
+@@ -268,6 +402,13 @@ EXPORT_SYMBOL(_raw_read_unlock_irqrestore);
+ #ifndef CONFIG_INLINE_READ_UNLOCK_IRQ
+ void __lockfunc _raw_read_unlock_irq(rwlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_read_unlock_irq(lock);
+ }
+ EXPORT_SYMBOL(_raw_read_unlock_irq);
+@@ -276,6 +417,13 @@ EXPORT_SYMBOL(_raw_read_unlock_irq);
+ #ifndef CONFIG_INLINE_READ_UNLOCK_BH
+ void __lockfunc _raw_read_unlock_bh(rwlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(0, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_read_unlock_bh(lock);
+ }
+ EXPORT_SYMBOL(_raw_read_unlock_bh);
+@@ -284,7 +432,17 @@ EXPORT_SYMBOL(_raw_read_unlock_bh);
+ #ifndef CONFIG_INLINE_WRITE_TRYLOCK
+ int __lockfunc _raw_write_trylock(rwlock_t *lock)
+ {
+-	return __raw_write_trylock(lock);
++	int r = __raw_write_trylock(lock);
++#ifdef CONFIG_DART
++	if (r) {
++		DART_FUNC_LIB_CALL_WRAP(
++				sync, gen_lock,
++				_DART_FLAG_SYNC(1, 1, 1), 0,
++				(data_64_t) lock
++		);
++	}
++#endif
++	return r;
+ }
+ EXPORT_SYMBOL(_raw_write_trylock);
+ #endif
+@@ -293,6 +451,13 @@ EXPORT_SYMBOL(_raw_write_trylock);
+ void __lockfunc _raw_write_lock(rwlock_t *lock)
+ {
+ 	__raw_write_lock(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_write_lock);
+ #endif
+@@ -300,7 +465,15 @@ EXPORT_SYMBOL(_raw_write_lock);
+ #ifndef CONFIG_INLINE_WRITE_LOCK_IRQSAVE
+ unsigned long __lockfunc _raw_write_lock_irqsave(rwlock_t *lock)
+ {
+-	return __raw_write_lock_irqsave(lock);
++	unsigned long r = __raw_write_lock_irqsave(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
++	return r;
+ }
+ EXPORT_SYMBOL(_raw_write_lock_irqsave);
+ #endif
+@@ -309,6 +482,13 @@ EXPORT_SYMBOL(_raw_write_lock_irqsave);
+ void __lockfunc _raw_write_lock_irq(rwlock_t *lock)
+ {
+ 	__raw_write_lock_irq(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_write_lock_irq);
+ #endif
+@@ -317,6 +497,13 @@ EXPORT_SYMBOL(_raw_write_lock_irq);
+ void __lockfunc _raw_write_lock_bh(rwlock_t *lock)
+ {
+ 	__raw_write_lock_bh(lock);
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_write_lock_bh);
+ #endif
+@@ -324,6 +511,13 @@ EXPORT_SYMBOL(_raw_write_lock_bh);
+ #ifndef CONFIG_INLINE_WRITE_UNLOCK
+ void __lockfunc _raw_write_unlock(rwlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_write_unlock(lock);
+ }
+ EXPORT_SYMBOL(_raw_write_unlock);
+@@ -332,6 +526,13 @@ EXPORT_SYMBOL(_raw_write_unlock);
+ #ifndef CONFIG_INLINE_WRITE_UNLOCK_IRQRESTORE
+ void __lockfunc _raw_write_unlock_irqrestore(rwlock_t *lock, unsigned long flags)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_write_unlock_irqrestore(lock, flags);
+ }
+ EXPORT_SYMBOL(_raw_write_unlock_irqrestore);
+@@ -340,6 +541,13 @@ EXPORT_SYMBOL(_raw_write_unlock_irqrestore);
+ #ifndef CONFIG_INLINE_WRITE_UNLOCK_IRQ
+ void __lockfunc _raw_write_unlock_irq(rwlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_write_unlock_irq(lock);
+ }
+ EXPORT_SYMBOL(_raw_write_unlock_irq);
+@@ -348,6 +556,13 @@ EXPORT_SYMBOL(_raw_write_unlock_irq);
+ #ifndef CONFIG_INLINE_WRITE_UNLOCK_BH
+ void __lockfunc _raw_write_unlock_bh(rwlock_t *lock)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_unlock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ 	__raw_write_unlock_bh(lock);
+ }
+ EXPORT_SYMBOL(_raw_write_unlock_bh);
+@@ -360,6 +575,14 @@ void __lockfunc _raw_spin_lock_nested(raw_spinlock_t *lock, int subclass)
+ 	preempt_disable();
+ 	spin_acquire(&lock->dep_map, subclass, 0, _RET_IP_);
+ 	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_spin_lock_nested);
+ 
+@@ -373,6 +596,15 @@ unsigned long __lockfunc _raw_spin_lock_irqsave_nested(raw_spinlock_t *lock,
+ 	spin_acquire(&lock->dep_map, subclass, 0, _RET_IP_);
+ 	LOCK_CONTENDED_FLAGS(lock, do_raw_spin_trylock, do_raw_spin_lock,
+ 				do_raw_spin_lock_flags, &flags);
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
++
+ 	return flags;
+ }
+ EXPORT_SYMBOL(_raw_spin_lock_irqsave_nested);
+@@ -383,6 +615,14 @@ void __lockfunc _raw_spin_lock_nest_lock(raw_spinlock_t *lock,
+ 	preempt_disable();
+ 	spin_acquire_nest(&lock->dep_map, 0, 0, nest_lock, _RET_IP_);
+ 	LOCK_CONTENDED(lock, do_raw_spin_trylock, do_raw_spin_lock);
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			sync, gen_lock,
++			_DART_FLAG_SYNC(1, 0, 1), 0,
++			(data_64_t) lock
++	);
++#endif
+ }
+ EXPORT_SYMBOL(_raw_spin_lock_nest_lock);
+ 
+diff --git a/kernel/module.c b/kernel/module.c
+index ff2d7359a418..4d94cefd594d 100644
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -59,6 +59,10 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/module.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #ifndef ARCH_SHF_SMALL
+ #define ARCH_SHF_SMALL 0
+ #endif
+@@ -971,6 +975,10 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
+ 	char name[MODULE_NAME_LEN];
+ 	int ret, forced = 0;
+ 
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
++
+ 	if (!capable(CAP_SYS_MODULE) || modules_disabled)
+ 		return -EPERM;
+ 
+@@ -1020,8 +1028,27 @@ SYSCALL_DEFINE2(delete_module, const char __user *, name_user,
+ 
+ 	mutex_unlock(&module_mutex);
+ 	/* Final destruction now no one is using it. */
+-	if (mod->exit != NULL)
++	if (mod->exit != NULL) {
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, syscall_enter,
++					DART_FLAG_CTRL_CTXT_CHANGE, 0
++			);
++		}
++#endif
+ 		mod->exit();
++#ifdef CONFIG_DART
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, syscall_exit,
++					DART_FLAG_CTRL_CTXT_CHANGE, 0
++			);
++			dart_switch_rel_meta();
++		}
++#endif
++	}
+ 	blocking_notifier_call_chain(&module_notify_list,
+ 				     MODULE_STATE_GOING, mod);
+ 	klp_module_going(mod);
+@@ -2182,6 +2209,10 @@ void __weak module_arch_freeing_init(struct module *mod)
+ /* Free a module, remove from lists, etc. */
+ static void free_module(struct module *mod)
+ {
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
++
+ 	trace_module_free(mod);
+ 
+ 	mod_sysfs_teardown(mod);
+@@ -2222,7 +2253,26 @@ static void free_module(struct module *mod)
+ 	module_arch_freeing_init(mod);
+ 	module_memfree(mod->init_layout.base);
+ 	kfree(mod->args);
++
++#ifdef CONFIG_DART
++	__dart = dart_switch_acq_meta();
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				ctxt, syscall_enter,
++				DART_FLAG_CTRL_CTXT_CHANGE, 0
++		);
++	}
++#endif
+ 	percpu_modfree(mod);
++#ifdef CONFIG_DART
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				ctxt, syscall_exit,
++				DART_FLAG_CTRL_CTXT_CHANGE, 0
++		);
++		dart_switch_rel_meta();
++	}
++#endif
+ 
+ 	/* Free lock-classes; relies on the preceding sync_rcu(). */
+ 	lockdep_free_key_range(mod->core_layout.base, mod->core_layout.size);
+@@ -3557,6 +3607,10 @@ static noinline int do_init_module(struct module *mod)
+ 	int ret = 0;
+ 	struct mod_initfree *freeinit;
+ 
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
++
+ 	freeinit = kmalloc(sizeof(*freeinit), GFP_KERNEL);
+ 	if (!freeinit) {
+ 		ret = -ENOMEM;
+@@ -3572,8 +3626,27 @@ static noinline int do_init_module(struct module *mod)
+ 
+ 	do_mod_ctors(mod);
+ 	/* Start the module */
+-	if (mod->init != NULL)
++	if (mod->init != NULL) {
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, syscall_enter,
++					DART_FLAG_CTRL_CTXT_CHANGE, 0
++			);
++		}
++#endif
+ 		ret = do_one_initcall(mod->init);
++#ifdef CONFIG_DART
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, syscall_exit,
++					DART_FLAG_CTRL_CTXT_CHANGE, 0
++			);
++			dart_switch_rel_meta();
++		}
++#endif
++	}
+ 	if (ret < 0) {
+ 		goto fail_free_freeinit;
+ 	}
+@@ -3782,6 +3855,9 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ 	struct module *mod;
+ 	long err = 0;
+ 	char *after_dashes;
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
+ 
+ 	err = elf_header_check(info);
+ 	if (err)
+@@ -3835,7 +3911,25 @@ static int load_module(struct load_info *info, const char __user *uargs,
+ #endif
+ 
+ 	/* To avoid stressing percpu allocator, do this once we're unique. */
++#ifdef CONFIG_DART
++	__dart = dart_switch_acq_meta();
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				ctxt, syscall_enter,
++				DART_FLAG_CTRL_CTXT_CHANGE, 0
++		);
++	}
++#endif
+ 	err = percpu_modalloc(mod, info);
++#ifdef CONFIG_DART
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				ctxt, syscall_exit,
++				DART_FLAG_CTRL_CTXT_CHANGE, 0
++		);
++		dart_switch_rel_meta();
++	}
++#endif
+ 	if (err)
+ 		goto unlink_mod;
+ 
+diff --git a/kernel/rcu/rcu.h b/kernel/rcu/rcu.h
+index 8fd4f82c9b3d..b6a5fc902b85 100644
+--- a/kernel/rcu/rcu.h
++++ b/kernel/rcu/rcu.h
+@@ -11,6 +11,9 @@
+ #define __LINUX_RCU_H
+ 
+ #include <trace/events/rcu.h>
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
+ 
+ /* Offset to allow distinguishing irq vs. task-based idle entry/exit. */
+ #define DYNTICK_IRQ_NONIDLE	((LONG_MAX / 2) + 1)
+@@ -208,18 +211,79 @@ static inline bool __rcu_reclaim(const char *rn, struct rcu_head *head)
+ {
+ 	rcu_callback_t f;
+ 	unsigned long offset = (unsigned long)head->func;
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
+ 
+ 	rcu_lock_acquire(&rcu_callback_map);
+ 	if (__is_kfree_rcu_offset(offset)) {
+ 		trace_rcu_invoke_kfree_callback(rn, head, offset);
++
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, rcu_enter,
++					DART_FLAG_NONE, (hval_64_t) head,
++					1ul
++			);
++			dart_switch_rel_meta();
++		}
++#endif
++
+ 		kfree((void *)head - offset);
++
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, rcu_exit,
++					DART_FLAG_NONE, (hval_64_t) head,
++					1ul
++			);
++			dart_switch_rel_meta();
++		}
++#endif
++
+ 		rcu_lock_release(&rcu_callback_map);
+ 		return true;
+ 	} else {
+ 		trace_rcu_invoke_callback(rn, head);
+ 		f = head->func;
+ 		WRITE_ONCE(head->func, (rcu_callback_t)0L);
++
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, rcu_enter,
++					DART_FLAG_NONE, (hval_64_t) head,
++					(data_64_t) offset
++			);
++			dart_switch_rel_meta();
++		}
++#endif
++
+ 		f(head);
++
++#ifdef CONFIG_DART
++		/* pair with the queue_arrive event in rcu_barrier() */
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE,
++				(hval_64_t) (&rcu_callback_map)
++		);
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, rcu_exit,
++					DART_FLAG_NONE, (data_64_t) head,
++					(data_64_t) offset
++			);
++			dart_switch_rel_meta();
++		}
++#endif
++
+ 		rcu_lock_release(&rcu_callback_map);
+ 		return false;
+ 	}
+diff --git a/kernel/rcu/tree.c b/kernel/rcu/tree.c
+index 81105141b6a8..673e48548863 100644
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@ -62,6 +62,10 @@
+ #include "tree.h"
+ #include "rcu.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #ifdef MODULE_PARAM_PREFIX
+ #undef MODULE_PARAM_PREFIX
+ #endif
+@@ -2572,6 +2576,15 @@ __call_rcu(struct rcu_head *head, rcu_callback_t func, bool lazy)
+ 		WRITE_ONCE(head->func, rcu_leak_callback);
+ 		return;
+ 	}
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, rcu_register,
++			DART_FLAG_NONE, (hval_64_t) head,
++			__is_kfree_rcu_offset((unsigned long)func) ? 1ul : (data_64_t) func
++	);
++#endif
++
+ 	head->func = func;
+ 	head->next = NULL;
+ 	local_irq_save(flags);
+@@ -2951,6 +2964,14 @@ void rcu_barrier(void)
+ 	rcu_barrier_trace(TPS("Inc2"), -1, rcu_state.barrier_sequence);
+ 	rcu_seq_end(&rcu_state.barrier_sequence);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_arrive,
++			DART_FLAG_NONE,
++			(hval_64_t) (&rcu_callback_map)
++	);
++#endif
++
+ 	/* Other rcu_barrier() invocations can now safely proceed. */
+ 	mutex_unlock(&rcu_state.barrier_mutex);
+ }
+diff --git a/kernel/sched/completion.c b/kernel/sched/completion.c
+index a1ad5b7d5521..9801505865a2 100644
+--- a/kernel/sched/completion.c
++++ b/kernel/sched/completion.c
+@@ -13,6 +13,10 @@
+  */
+ #include "sched.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /**
+  * complete: - signals a single thread waiting on this completion
+  * @x:  holds the state of this particular completion
+@@ -87,6 +91,14 @@ do_wait_for_common(struct completion *x,
+ 		if (!x->done)
+ 			return timeout;
+ 	}
++#ifdef CONFIG_DART
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, (hval_64_t) (&x->wait)
++		);
++	}
++#endif
+ 	if (x->done != UINT_MAX)
+ 		x->done--;
+ 	return timeout ?: 1;
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index dd05a378631a..a33041809b18 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -23,6 +23,10 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ /*
+  * Export tracepoints that act as a bare tracehook (ie: have no trace event
+  * associated with them) to allow external modules to probe them.
+@@ -3994,6 +3998,13 @@ static void __sched notrace __schedule(bool preempt)
+ 	struct rq *rq;
+ 	int cpu;
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
++
+ 	cpu = smp_processor_id();
+ 	rq = cpu_rq(cpu);
+ 	prev = rq->curr;
+@@ -4073,6 +4084,13 @@ static void __sched notrace __schedule(bool preempt)
+ 	}
+ 
+ 	balance_callback(rq);
++
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
+ }
+ 
+ void __noreturn do_task_dead(void)
+diff --git a/kernel/sched/wait.c b/kernel/sched/wait.c
+index c1e566a114ca..1507d1cd09c2 100644
+--- a/kernel/sched/wait.c
++++ b/kernel/sched/wait.c
+@@ -6,6 +6,10 @@
+  */
+ #include "sched.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ void __init_waitqueue_head(struct wait_queue_head *wq_head, const char *name, struct lock_class_key *key)
+ {
+ 	spin_lock_init(&wq_head->lock);
+@@ -69,9 +73,20 @@ static int __wake_up_common(struct wait_queue_head *wq_head, unsigned int mode,
+ {
+ 	wait_queue_entry_t *curr, *next;
+ 	int cnt = 0;
++#ifdef CONFIG_DART
++	bool __dart;
++	wait_queue_func_t __current_func;
++#endif
+ 
+ 	lockdep_assert_held(&wq_head->lock);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE, (hval_64_t) wq_head
++	);
++#endif
++
+ 	if (bookmark && (bookmark->flags & WQ_FLAG_BOOKMARK)) {
+ 		curr = list_next_entry(bookmark, entry);
+ 
+@@ -90,7 +105,37 @@ static int __wake_up_common(struct wait_queue_head *wq_head, unsigned int mode,
+ 		if (flags & WQ_FLAG_BOOKMARK)
+ 			continue;
+ 
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			__current_func = curr->func;  /* in case curr is freed */
++			DART_FUNC_LIB_CALL_IMPL(
++					event, wait_notify_enter,
++					DART_FLAG_NONE, (hval_64_t) curr,
++					(data_64_t) __current_func
++			);
++			dart_switch_rel_meta();
++			/* pair with queue_notify event in prepare_to_wait()... */
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_arrive,
++					DART_FLAG_NONE, (hval_64_t) (&curr->entry)
++			);
++		};
++#endif
+ 		ret = curr->func(curr, mode, wake_flags, key);
++
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					event, wait_notify_exit,
++					DART_FLAG_NONE, (hval_64_t) curr,
++					(data_64_t) __current_func
++			);
++			dart_switch_rel_meta();
++		}
++#endif
++
+ 		if (ret < 0)
+ 			break;
+ 		if (ret && (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+@@ -227,6 +272,15 @@ prepare_to_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_ent
+ 	spin_lock_irqsave(&wq_head->lock, flags);
+ 	if (list_empty(&wq_entry->entry))
+ 		__add_wait_queue(wq_head, wq_entry);
++#ifdef CONFIG_DART
++	/* event callbacks has attach too */
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&wq_entry->entry)
++		);
++	}
++#endif
+ 	set_current_state(state);
+ 	spin_unlock_irqrestore(&wq_head->lock, flags);
+ }
+@@ -241,6 +295,15 @@ prepare_to_wait_exclusive(struct wait_queue_head *wq_head, struct wait_queue_ent
+ 	spin_lock_irqsave(&wq_head->lock, flags);
+ 	if (list_empty(&wq_entry->entry))
+ 		__add_wait_queue_entry_tail(wq_head, wq_entry);
++#ifdef CONFIG_DART
++	/* event callbacks has attach too */
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&wq_entry->entry)
++		);
++	}
++#endif
+ 	set_current_state(state);
+ 	spin_unlock_irqrestore(&wq_head->lock, flags);
+ }
+@@ -283,6 +346,16 @@ long prepare_to_wait_event(struct wait_queue_head *wq_head, struct wait_queue_en
+ 			else
+ 				__add_wait_queue(wq_head, wq_entry);
+ 		}
++#ifdef CONFIG_DART
++		/* event callbacks has attach too */
++		else {
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_notify,
++					DART_FLAG_NONE, (hval_64_t) (&wq_entry->entry)
++			);
++		}
++#endif
++
+ 		set_current_state(state);
+ 	}
+ 	spin_unlock_irqrestore(&wq_head->lock, flags);
+@@ -302,6 +375,15 @@ int do_wait_intr(wait_queue_head_t *wq, wait_queue_entry_t *wait)
+ {
+ 	if (likely(list_empty(&wait->entry)))
+ 		__add_wait_queue_entry_tail(wq, wait);
++#ifdef CONFIG_DART
++	/* event callbacks has attach too */
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&wait->entry)
++		);
++	}
++#endif
+ 
+ 	set_current_state(TASK_INTERRUPTIBLE);
+ 	if (signal_pending(current))
+@@ -319,6 +401,15 @@ int do_wait_intr_irq(wait_queue_head_t *wq, wait_queue_entry_t *wait)
+ {
+ 	if (likely(list_empty(&wait->entry)))
+ 		__add_wait_queue_entry_tail(wq, wait);
++#ifdef CONFIG_DART
++	/* event callbacks has attach too */
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&wait->entry)
++		);
++	}
++#endif
+ 
+ 	set_current_state(TASK_INTERRUPTIBLE);
+ 	if (signal_pending(current))
+@@ -346,6 +437,30 @@ void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_en
+ 	unsigned long flags;
+ 
+ 	__set_current_state(TASK_RUNNING);
++
++#ifdef CONFIG_DART
++	/*
++	 * There is nothing wrong with the original implementation, but
++	 * it causes trouble for DART in the sense that list_del_init
++	 * can be executed multiple times without error. To be specific:
++	 *
++	 * T1:                    [L] list_del_init(entry) [U]
++	 * T2: list_empty_careful                              [L] list_del_init(entry) [U]
++	 *
++	 * This seems to be fine, but it will show-up in DART that the wait
++	 * is passed twice. As a result, we force a lock here.
++	 */
++	spin_lock_irqsave(&wq_head->lock, flags);
++	if (!list_empty(&wq_entry->entry)) {
++		list_del_init(&wq_entry->entry);
++		DART_FUNC_LIB_CALL_WRAP(
++				event, wait_pass,
++				DART_FLAG_NONE, (hval_64_t) wq_entry,
++				(data_64_t) (wq_entry->func)
++		);
++	}
++	spin_unlock_irqrestore(&wq_head->lock, flags);
++#else
+ 	/*
+ 	 * We can check for list emptiness outside the lock
+ 	 * IFF:
+@@ -364,6 +479,7 @@ void finish_wait(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_en
+ 		list_del_init(&wq_entry->entry);
+ 		spin_unlock_irqrestore(&wq_head->lock, flags);
+ 	}
++#endif
+ }
+ EXPORT_SYMBOL(finish_wait);
+ 
+@@ -371,8 +487,16 @@ int autoremove_wake_function(struct wait_queue_entry *wq_entry, unsigned mode, i
+ {
+ 	int ret = default_wake_function(wq_entry, mode, sync, key);
+ 
+-	if (ret)
++	if (ret) {
+ 		list_del_init(&wq_entry->entry);
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, wait_pass,
++				DART_FLAG_NONE, (hval_64_t) wq_entry,
++				(data_64_t) (wq_entry->func)
++		);
++#endif
++	}
+ 
+ 	return ret;
+ }
+diff --git a/kernel/sched/wait_bit.c b/kernel/sched/wait_bit.c
+index 45eba18a2898..96b01e78e071 100644
+--- a/kernel/sched/wait_bit.c
++++ b/kernel/sched/wait_bit.c
+@@ -4,6 +4,10 @@
+  */
+ #include "sched.h"
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #define WAIT_TABLE_BITS 8
+ #define WAIT_TABLE_SIZE (1 << WAIT_TABLE_BITS)
+ 
+@@ -122,6 +126,15 @@ void __wake_up_bit(struct wait_queue_head *wq_head, void *word, int bit)
+ {
+ 	struct wait_bit_key key = __WAIT_BIT_KEY_INITIALIZER(word, bit);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE, (hval_64_t) _CANTOR_PAIR(
++				(unsigned long) word, (unsigned long) bit
++			)
++	);
++#endif
++
+ 	if (waitqueue_active(wq_head))
+ 		__wake_up(wq_head, TASK_NORMAL, 1, &key);
+ }
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 7dbcb402c2fc..6a4397e59c6f 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -21,6 +21,10 @@
+ #include <linux/sched/idle.h>
+ #include <linux/hypervisor.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #include "smpboot.h"
+ 
+ enum {
+@@ -176,8 +180,17 @@ static int generic_exec_single(int cpu, call_single_data_t *csd,
+ 	 * locking and barrier primitives. Generic code isn't really
+ 	 * equipped to do the right thing...
+ 	 */
+-	if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
++	if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu))) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				async, ipi_register,
++				DART_FLAG_NONE,
++				_CANTOR_PAIR(((hval_64_t) csd), ((hval_64_t) cpu)),
++				(data_64_t) func
++		);
++#endif
+ 		arch_send_call_function_single_ipi(cpu);
++	}
+ 
+ 	return 0;
+ }
+@@ -214,6 +227,11 @@ static void flush_smp_call_function_queue(bool warn_cpu_offline)
+ 	call_single_data_t *csd, *csd_next;
+ 	static bool warned;
+ 
++#ifdef CONFIG_DART
++	bool __dart;
++	hval_64_t __hval;
++#endif
++
+ 	lockdep_assert_irqs_disabled();
+ 
+ 	head = this_cpu_ptr(&call_single_queue);
+@@ -241,11 +259,69 @@ static void flush_smp_call_function_queue(bool warn_cpu_offline)
+ 
+ 		/* Do we wait until *after* callback? */
+ 		if (csd->flags & CSD_FLAG_SYNCHRONOUS) {
++#ifdef CONFIG_DART
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				__hval = _CANTOR_PAIR(((hval_64_t) csd), ((hval_64_t) smp_processor_id()));
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, ipi_enter,
++						DART_FLAG_NONE, __hval,
++						(data_64_t) func
++				);
++				dart_switch_rel_meta();
++			}
++#endif
+ 			func(info);
++#ifdef CONFIG_DART
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, ipi_exit,
++						DART_FLAG_NONE, __hval,
++						(data_64_t) func
++				);
++				dart_switch_rel_meta();
++			}
++#endif
+ 			csd_unlock(csd);
+ 		} else {
++#ifdef CONFIG_DART
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				__hval = _CANTOR_PAIR(((hval_64_t) csd), ((hval_64_t) smp_processor_id()));
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, ipi_enter,
++						DART_FLAG_NONE, __hval,
++						(data_64_t) func
++				);
++				dart_switch_rel_meta();
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, background,
++						DART_FLAG_NONE, __hval
++				);
++			}
++#endif
+ 			csd_unlock(csd);
++#ifdef CONFIG_DART
++			if (__dart) {
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, foreground,
++						DART_FLAG_NONE, __hval
++				);
++			}
++#endif
+ 			func(info);
++#ifdef CONFIG_DART
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, ipi_exit,
++						DART_FLAG_NONE, __hval,
++						(data_64_t) func
++				);
++				dart_switch_rel_meta();
++			}
++#endif
+ 		}
+ 	}
+ 
+@@ -470,8 +546,17 @@ void smp_call_function_many(const struct cpumask *mask,
+ 			csd->flags |= CSD_FLAG_SYNCHRONOUS;
+ 		csd->func = func;
+ 		csd->info = info;
+-		if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu)))
++		if (llist_add(&csd->llist, &per_cpu(call_single_queue, cpu))) {
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++					async, ipi_register,
++					DART_FLAG_NONE,
++					_CANTOR_PAIR(((hval_64_t) csd), ((hval_64_t) cpu)),
++					(data_64_t) func
++			);
++#endif
+ 			__cpumask_set_cpu(cpu, cfd->cpumask_ipi);
++		}
+ 	}
+ 
+ 	/* Send a message to all CPUs in the map */
+diff --git a/kernel/task_work.c b/kernel/task_work.c
+index 0fef395662a6..2f60a5a79238 100644
+--- a/kernel/task_work.c
++++ b/kernel/task_work.c
+@@ -3,6 +3,10 @@
+ #include <linux/task_work.h>
+ #include <linux/tracehook.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ static struct callback_head work_exited; /* all we need is ->next == NULL */
+ 
+ /**
+@@ -36,6 +40,14 @@ task_work_add(struct task_struct *task, struct callback_head *work, bool notify)
+ 		work->next = head;
+ 	} while (cmpxchg(&task->task_works, head, work) != head);
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, task_register,
++			DART_FLAG_NONE, (hval_64_t) work,
++			(data_64_t) work->func
++	);
++#endif
++
+ 	if (notify)
+ 		set_notify_resume(task);
+ 	return 0;
+@@ -71,8 +83,16 @@ task_work_cancel(struct task_struct *task, task_work_func_t func)
+ 	while ((work = READ_ONCE(*pprev))) {
+ 		if (work->func != func)
+ 			pprev = &work->next;
+-		else if (cmpxchg(pprev, work, work->next) == work)
++		else if (cmpxchg(pprev, work, work->next) == work) {
++#ifdef CONFIG_DART
++			DART_FUNC_LIB_CALL_WRAP(
++				async, task_cancel,
++				DART_FLAG_NONE, (hval_64_t) work,
++				(data_64_t) (work->func)
++			);
++#endif
+ 			break;
++		}
+ 	}
+ 	raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+ 
+@@ -91,6 +111,10 @@ void task_work_run(void)
+ {
+ 	struct task_struct *task = current;
+ 	struct callback_head *work, *head, *next;
++#ifdef CONFIG_DART
++	bool __dart;
++	task_work_func_t __current_func;
++#endif
+ 
+ 	for (;;) {
+ 		/*
+@@ -103,6 +127,25 @@ void task_work_run(void)
+ 			head = !work && (task->flags & PF_EXITING) ?
+ 				&work_exited : NULL;
+ 		} while (cmpxchg(&task->task_works, work, head) != work);
++#ifdef CONFIG_DART
++		if (work) {
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				__current_func = work->func;  /* in case work is freed */
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, task_enter,
++						DART_FLAG_NONE, (hval_64_t) (work),
++						(data_64_t) __current_func
++				);
++				dart_switch_rel_meta();
++				/* woke up too early, delay tracing until actual call */
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, background,
++						DART_FLAG_NONE, (hval_64_t) work
++				);
++			}
++		}
++#endif
+ 		raw_spin_unlock_irq(&task->pi_lock);
+ 
+ 		if (!work)
+@@ -110,7 +153,26 @@ void task_work_run(void)
+ 
+ 		do {
+ 			next = work->next;
++#ifdef CONFIG_DART
++			if (__dart) {
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, foreground,
++						DART_FLAG_NONE, (hval_64_t) work
++				);
++			}
++#endif
+ 			work->func(work);
++#ifdef CONFIG_DART
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, task_exit,
++						DART_FLAG_NONE, (hval_64_t) work,
++						(data_64_t) __current_func
++				);
++				dart_switch_rel_meta();
++			}
++#endif
+ 			work = next;
+ 			cond_resched();
+ 		} while (work);
+diff --git a/kernel/time/timer.c b/kernel/time/timer.c
+index 4820823515e9..7f73be48e96b 100644
+--- a/kernel/time/timer.c
++++ b/kernel/time/timer.c
+@@ -50,6 +50,10 @@
+ #include <asm/timex.h>
+ #include <asm/io.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #include "tick-internal.h"
+ 
+ #define CREATE_TRACE_POINTS
+@@ -537,6 +541,14 @@ static int calc_wheel_index(unsigned long expires, unsigned long clk)
+ static void enqueue_timer(struct timer_base *base, struct timer_list *timer,
+ 			  unsigned int idx)
+ {
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, timer_register,
++			DART_FLAG_NONE, (hval_64_t) timer,
++			(data_64_t) (timer->function)
++	);
++#endif
++
+ 	hlist_add_head(&timer->entry, base->vectors + idx);
+ 	__set_bit(idx, base->pending_map);
+ 	timer_set_idx(timer, idx);
+@@ -826,6 +838,14 @@ static int detach_if_pending(struct timer_list *timer, struct timer_base *base,
+ 	if (!timer_pending(timer))
+ 		return 0;
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, timer_cancel,
++			DART_FLAG_NONE, (hval_64_t) timer,
++			(data_64_t) (timer->function)
++	);
++#endif
++
+ 	if (hlist_is_singular_node(&timer->entry, base->vectors + idx))
+ 		__clear_bit(idx, base->pending_map);
+ 
+@@ -1431,8 +1451,27 @@ static void expire_timers(struct timer_base *base, struct hlist_head *head)
+ 	while (!hlist_empty(head)) {
+ 		struct timer_list *timer;
+ 		void (*fn)(struct timer_list *);
++#ifdef CONFIG_DART
++		bool __dart;
++#endif
+ 
+ 		timer = hlist_entry(head->first, struct timer_list, entry);
++#ifdef CONFIG_DART
++		__dart = dart_switch_acq_meta();
++		if (__dart) {
++			DART_FUNC_LIB_CALL_IMPL(
++					ctxt, timer_enter,
++					DART_FLAG_NONE, (hval_64_t) timer,
++					(data_64_t) (timer->function)
++			);
++			dart_switch_rel_meta();
++			/* woke up too early, delay tracing until actual function call */
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, background,
++					DART_FLAG_NONE, (hval_64_t) timer
++			);
++		}
++#endif
+ 
+ 		base->running_timer = timer;
+ 		detach_timer(timer, true);
+@@ -1441,12 +1480,50 @@ static void expire_timers(struct timer_base *base, struct hlist_head *head)
+ 
+ 		if (timer->flags & TIMER_IRQSAFE) {
+ 			raw_spin_unlock(&base->lock);
++#ifdef CONFIG_DART
++			if (__dart) {
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, foreground,
++						DART_FLAG_NONE, (hval_64_t) (base->running_timer)
++				);
++			}
++#endif
+ 			call_timer_fn(timer, fn, baseclk);
++#ifdef CONFIG_DART
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, timer_exit,
++						DART_FLAG_NONE, (hval_64_t) (base->running_timer),
++						(data_64_t) (fn)
++				);
++				dart_switch_rel_meta();
++			}
++#endif
+ 			base->running_timer = NULL;
+ 			raw_spin_lock(&base->lock);
+ 		} else {
+ 			raw_spin_unlock_irq(&base->lock);
++#ifdef CONFIG_DART
++			if (__dart) {
++				DART_FUNC_LIB_CALL_WRAP(
++						exec, foreground,
++						DART_FLAG_NONE, (hval_64_t) (base->running_timer)
++				);
++			}
++#endif
+ 			call_timer_fn(timer, fn, baseclk);
++#ifdef CONFIG_DART
++			__dart = dart_switch_acq_meta();
++			if (__dart) {
++				DART_FUNC_LIB_CALL_IMPL(
++						ctxt, timer_exit,
++						DART_FLAG_NONE, (hval_64_t) (base->running_timer),
++						(data_64_t) (fn)
++				);
++				dart_switch_rel_meta();
++			}
++#endif
+ 			base->running_timer = NULL;
+ 			timer_sync_wait_running(base);
+ 			raw_spin_lock_irq(&base->lock);
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index bc2e09a8ea61..a8ec7ee1355a 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -51,6 +51,10 @@
+ #include <linux/sched/isolation.h>
+ #include <linux/nmi.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #include "workqueue_internal.h"
+ 
+ enum {
+@@ -1291,6 +1295,14 @@ static int try_to_grab_pending(struct work_struct *work, bool is_dwork,
+ 		list_del_init(&work->entry);
+ 		pwq_dec_nr_in_flight(pwq, get_work_color(work));
+ 
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				async, work_cancel,
++				DART_FLAG_NONE, (hval_64_t) work,
++				(data_64_t) (work->func)
++		);
++#endif
++
+ 		/* work->data points to pwq iff queued, point to pool */
+ 		set_work_pool_and_keep_pending(work, pool->id);
+ 
+@@ -1326,6 +1338,14 @@ static void insert_work(struct pool_workqueue *pwq, struct work_struct *work,
+ {
+ 	struct worker_pool *pool = pwq->pool;
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			async, work_register,
++			DART_FLAG_NONE, (hval_64_t) work,
++			(data_64_t) work->func
++	);
++#endif
++
+ 	/* we own @work, set data and link */
+ 	set_work_pwq(work, pwq, extra_flags);
+ 	list_add_tail(&work->entry, head);
+@@ -1414,6 +1434,7 @@ static void __queue_work(int cpu, struct workqueue_struct *wq,
+ 	if (unlikely(wq->flags & __WQ_DRAINING) &&
+ 	    WARN_ON_ONCE(!is_chained_work(wq)))
+ 		return;
++
+ 	rcu_read_lock();
+ retry:
+ 	if (req_cpu == WORK_CPU_UNBOUND)
+@@ -1518,6 +1539,14 @@ bool queue_work_on(int cpu, struct workqueue_struct *wq,
+ 		__queue_work(cpu, wq, work);
+ 		ret = true;
+ 	}
++#ifdef CONFIG_DART
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&work->entry)
++		);
++	}
++#endif
+ 
+ 	local_irq_restore(flags);
+ 	return ret;
+@@ -1602,6 +1631,14 @@ bool queue_work_node(int node, struct workqueue_struct *wq,
+ 		__queue_work(cpu, wq, work);
+ 		ret = true;
+ 	}
++#ifdef CONFIG_DART
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&work->entry)
++		);
++	}
++#endif
+ 
+ 	local_irq_restore(flags);
+ 	return ret;
+@@ -1674,6 +1711,14 @@ bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
+ 		__queue_delayed_work(cpu, wq, dwork, delay);
+ 		ret = true;
+ 	}
++#ifdef CONFIG_DART
++	else {
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, (hval_64_t) (&work->entry)
++		);
++	}
++#endif
+ 
+ 	local_irq_restore(flags);
+ 	return ret;
+@@ -2168,6 +2213,9 @@ __acquires(&pool->lock)
+ 	bool cpu_intensive = pwq->wq->flags & WQ_CPU_INTENSIVE;
+ 	int work_color;
+ 	struct worker *collision;
++#ifdef CONFIG_DART
++	bool __dart;
++#endif
+ #ifdef CONFIG_LOCKDEP
+ 	/*
+ 	 * It is permissible to free the struct work_struct from
+@@ -2231,6 +2279,28 @@ __acquires(&pool->lock)
+ 	if (need_more_worker(pool))
+ 		wake_up_worker(pool);
+ 
++#ifdef CONFIG_DART
++	__dart = dart_switch_acq_meta();
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				ctxt, work_enter,
++				DART_FLAG_NONE, (hval_64_t) worker->current_work,
++				(data_64_t) (worker->current_func)
++		);
++		dart_switch_rel_meta();
++		/* pair with the queue_notify event in queue_work_on() */
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, (hval_64_t) (&work->entry)
++		);
++		/* woke up too early, delay tracing until actual function call */
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, background,
++				DART_FLAG_NONE, (hval_64_t) worker->current_work
++		);
++	}
++#endif
++
+ 	/*
+ 	 * Record the last pool and clear PENDING which should be the last
+ 	 * update to @work.  Also, do this inside @pool->lock so that
+@@ -2266,7 +2336,31 @@ __acquires(&pool->lock)
+ 	 */
+ 	lockdep_invariant_state(true);
+ 	trace_workqueue_execute_start(work);
++#ifdef CONFIG_DART
++	if (__dart) {
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, foreground,
++				DART_FLAG_NONE, (hval_64_t) worker->current_work
++		);
++	}
++#endif
+ 	worker->current_func(work);
++#ifdef CONFIG_DART
++	/* pair with the queue_arrive event in __flush_work() */
++	DART_FUNC_LIB_CALL_WRAP(
++			event, queue_notify,
++			DART_FLAG_NONE, (hval_64_t) worker->current_work
++	);
++	__dart = dart_switch_acq_meta();
++	if (__dart) {
++		DART_FUNC_LIB_CALL_IMPL(
++				ctxt, work_exit,
++				DART_FLAG_NONE, (hval_64_t) worker->current_work,
++				(data_64_t) (worker->current_func)
++		);
++		dart_switch_rel_meta();
++	}
++#endif
+ 	/*
+ 	 * While we must be careful to not use "work" after this, the trace
+ 	 * point will only record its address.
+@@ -3041,6 +3135,12 @@ static bool __flush_work(struct work_struct *work, bool from_cancel)
+ 		destroy_work_on_stack(&barr.work);
+ 		return true;
+ 	} else {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_arrive,
++				DART_FLAG_NONE, (hval_64_t) work
++		);
++#endif
+ 		return false;
+ 	}
+ }
+diff --git a/lib/Kconfig.dart b/lib/Kconfig.dart
+new file mode 100644
+index 000000000000..b3dbffe1e0b1
+--- /dev/null
++++ b/lib/Kconfig.dart
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config DART
++	bool "Dynamic Analysis Runtime"
++	select CONSTRUCTORS
++	select STACKDEPOT
++	help
++	  This option enables the dynamic analysis runtime.
++
++config DART_DEVEL
++	bool "DART development"
++	default n
++	depends on DART
++	help
++	  This option enables assertion and logging in DART.
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 93d97f9b0157..cb34a0cb19d0 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -2086,6 +2086,8 @@ source "lib/Kconfig.kgdb"
+ 
+ source "lib/Kconfig.ubsan"
+ 
++source "lib/Kconfig.dart"
++
+ config ARCH_HAS_DEVMEM_IS_ALLOWED
+ 	bool
+ 
+diff --git a/lib/Makefile b/lib/Makefile
+index c5892807e06f..40d1d64f4347 100644
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@ -255,6 +255,9 @@ quiet_cmd_crc64 = GEN     $@
+ $(obj)/crc64table.h: $(obj)/gen_crc64table
+ 	$(call cmd,crc64)
+ 
++# racer config
++obj-$(CONFIG_DART) += dart/
++
+ #
+ # Build a fast OID lookip registry from include/linux/oid_registry.h
+ #
+diff --git a/lib/dart b/lib/dart
+new file mode 120000
+index 000000000000..1c9e16c57be0
+--- /dev/null
++++ b/lib/dart
+@@ -0,0 +1 @@
++../../../pass/dart
+\ No newline at end of file
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 85b7d087eb45..d32961f3ffe8 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1031,12 +1031,33 @@ static int wake_page_function(wait_queue_entry_t *wait, unsigned mode, int sync,
+ 	struct wait_page_queue *wait_page
+ 		= container_of(wait, struct wait_page_queue, wait);
+ 
+-	if (wait_page->page != key->page)
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, pause,
++			DART_FLAG_NONE, 0
++	);
++#endif
++
++	if (wait_page->page != key->page) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, resume,
++				DART_FLAG_NONE, 0
++		);
++#endif
+ 	       return 0;
++	}
+ 	key->page_match = 1;
+ 
+-	if (wait_page->bit_nr != key->bit_nr)
++	if (wait_page->bit_nr != key->bit_nr) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, resume,
++				DART_FLAG_NONE, 0
++		);
++#endif
+ 		return 0;
++	}
+ 
+ 	/*
+ 	 * Stop walking if it's locked.
+@@ -1046,9 +1067,22 @@ static int wake_page_function(wait_queue_entry_t *wait, unsigned mode, int sync,
+ 	 * a reference to the *same usage* of this page; so there is no need
+ 	 * to walk on to wake even the put_and_wait_on_page_locked() callers.
+ 	 */
+-	if (test_bit(key->bit_nr, &key->page->flags))
++	if (test_bit(key->bit_nr, &key->page->flags)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				exec, resume,
++				DART_FLAG_NONE, 0
++		);
++#endif
+ 		return -1;
++	}
+ 
++#ifdef CONFIG_DART
++	DART_FUNC_LIB_CALL_WRAP(
++			exec, resume,
++			DART_FLAG_NONE, 0
++	);
++#endif
+ 	return autoremove_wake_function(wait, mode, sync, key);
+ }
+ 
+@@ -1108,8 +1142,17 @@ static void wake_up_page_bit(struct page *page, int bit_nr)
+ 
+ static void wake_up_page(struct page *page, int bit)
+ {
+-	if (!PageWaiters(page))
++	if (!PageWaiters(page)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(
++				event, queue_notify,
++				DART_FLAG_NONE, _CANTOR_PAIR(
++					(hval_64_t) page, (hval_64_t) bit
++				)
++		);
++#endif
+ 		return;
++	}
+ 	wake_up_page_bit(page, bit);
+ }
+ 
+@@ -1162,6 +1205,14 @@ static inline int wait_on_page_bit_common(wait_queue_head_t *q,
+ 			__add_wait_queue_entry_tail(q, wait);
+ 			SetPageWaiters(page);
+ 		}
++#ifdef CONFIG_DART
++		else {
++			DART_FUNC_LIB_CALL_WRAP(
++					event, queue_notify,
++					DART_FLAG_NONE, (hval_64_t) (&wait->entry)
++			);
++		}
++#endif
+ 
+ 		set_current_state(state);
+ 
+diff --git a/mm/page-writeback.c b/mm/page-writeback.c
+index 50055d2e4ea8..2fb8bfb819fc 100644
+--- a/mm/page-writeback.c
++++ b/mm/page-writeback.c
+@@ -40,6 +40,10 @@
+ #include <linux/mm_inline.h>
+ #include <trace/events/writeback.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #include "internal.h"
+ 
+ /*
+@@ -589,7 +593,23 @@ static void wb_domain_writeout_inc(struct wb_domain *dom,
+ 		 * roughly the same.
+ 		 */
+ 		dom->period_time = wp_next_time(jiffies);
++#ifdef CONFIG_DART
++		if ((dom->period_time / HZ) >= DART_TIMER_LIMIT_IN_SECONDS) {
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, pause,
++					DART_FLAG_NONE, 0
++			);
++		}
++#endif
+ 		mod_timer(&dom->period_timer, dom->period_time);
++#ifdef CONFIG_DART
++		if ((dom->period_time / HZ) >= DART_TIMER_LIMIT_IN_SECONDS) {
++			DART_FUNC_LIB_CALL_WRAP(
++					exec, resume,
++					DART_FLAG_NONE, 0
++			);
++		}
++#endif
+ 	}
+ }
+ 
+diff --git a/mm/slab.c b/mm/slab.c
+index 66e5d8032bae..3aeb56271e9e 100644
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -126,6 +126,10 @@
+ 
+ #include <trace/events/kmem.h>
+ 
++#ifdef CONFIG_DART
++#include <dart.h>
++#endif
++
+ #include	"internal.h"
+ 
+ #include	"slab.h"
+@@ -3422,8 +3426,12 @@ static __always_inline void __cache_free(struct kmem_cache *cachep, void *objp,
+ 					 unsigned long caller)
+ {
+ 	/* Put the object into the quarantine, don't touch it for now. */
+-	if (kasan_slab_free(cachep, objp, _RET_IP_))
++	if (kasan_slab_free(cachep, objp, _RET_IP_)) {
++#ifdef CONFIG_DART
++		DART_FUNC_LIB_CALL_WRAP(mem, heap_free, DART_FLAG_NONE, 0, objp);
++#endif
+ 		return;
++	}
+ 
+ 	___cache_free(cachep, objp, caller);
+ }
+diff --git a/net/9p/Makefile b/net/9p/Makefile
+index aa0a5641e5d0..5ca05540c4b8 100644
+--- a/net/9p/Makefile
++++ b/net/9p/Makefile
+@@ -20,3 +20,5 @@ obj-$(CONFIG_NET_9P_RDMA) += 9pnet_rdma.o
+ 
+ 9pnet_rdma-objs := \
+ 	trans_rdma.o \
++
++KTSAN_SANITIZE := n
+diff --git a/scripts/kconfig/Makefile b/scripts/kconfig/Makefile
+index ef2f2336c469..f0ce9b8bd46f 100644
+--- a/scripts/kconfig/Makefile
++++ b/scripts/kconfig/Makefile
+@@ -100,6 +100,42 @@ PHONY += kvmconfig
+ kvmconfig: kvm_guest.config
+ 	@:
+ 
++PHONY += qemuconfig
++qemuconfig: qemu_guest.config
++	@:
++
++PHONY += racer_ext4_config
++racer_ext4_config: racer_ext4.config
++	@:
++
++PHONY += racer_btrfs_config
++racer_btrfs_config: racer_btrfs.config
++	@:
++
++PHONY += racer_xfs_config
++racer_xfs_config: racer_xfs.config
++	@:
++
++PHONY += check_lockdep_config
++check_lockdep_config: check_lockdep.config
++	@:
++
++PHONY += check_kasan_config
++check_kasan_config: check_kasan.config
++	@:
++
++PHONY += check_ktsan_config
++check_ktsan_config: check_ktsan.config
++	@:
++
++PHONY += dart_config
++dart_config: dart.config
++	@:
++
++PHONY += dart_devel_config
++dart_devel_config: dart_devel.config
++	@:
++
+ PHONY += xenconfig
+ xenconfig: xen.config
+ 	@:
+@@ -137,6 +173,7 @@ help:
+ 	@echo  '  olddefconfig	  - Same as oldconfig but sets new symbols to their'
+ 	@echo  '                    default value without prompting'
+ 	@echo  '  kvmconfig	  - Enable additional options for kvm guest kernel support'
++	@echo  '  qemuconfig 	  - Enable additional options for qemu guest kernel support'
+ 	@echo  '  xenconfig       - Enable additional options for xen dom0 and guest kernel support'
+ 	@echo  '  tinyconfig	  - Configure the tiniest possible kernel'
+ 	@echo  '  testconfig	  - Run Kconfig unit tests (requires python3 and pytest)'

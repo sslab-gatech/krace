@@ -1,0 +1,8 @@
+# python cache
+/__pycache__/
+
+# mypy
+/.mypy_cache/
+
+# ide
+/.idea/

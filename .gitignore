@@ -1,0 +1,11 @@
+# project directories
+/studio/
+
+# editor
+*.swp
+*.swo
+
+# ide
+.idea/
+cmake-build-*/
+.clion.*

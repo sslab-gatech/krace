@@ -1,0 +1,18 @@
+{
+  "src": {
+    "FORK": null,
+    "JOIN": null,
+    "EMBED": 1,
+    "QUEUE": 0,
+    "ORDER": 0,
+    "FIFO": 0
+  },
+  "dst": {
+    "FORK": null,
+    "JOIN": null,
+    "EMBED": 1,
+    "QUEUE": 0,
+    "ORDER": 0,
+    "FIFO": 0
+  }
+}
